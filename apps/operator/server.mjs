@@ -4,6 +4,7 @@ import { createPublicClient, http, erc20Abi, encodeFunctionData, parseEventLogs 
 import { monadTestnet } from 'viem/chains';
 import { createAgentPay, createAiplansDiscovery, createX402PaymentSigner, signProcurementPolicy, signReservationIntent } from '@toolkit-fun/agentpay-sdk';
 import { fileURLToPath } from 'node:url';
+import { createSIWxPayload, encodeSIWxHeader } from '@x402/extensions/sign-in-with-x';
 
 export const NETWORK = Object.freeze({ chainId: 10143, rpc: 'https://testnet-rpc.monad.xyz', merchant: 'https://staging.toolkit.fun', asset: '0x534b2f3A21130d7a60830c2Df862319e593943A3', payTo: '0x16E0e71068eb63140aEB56678d6840982b7AFbB1', permit2: '0x000000000022D473030F116dDEE9F6B43aC78BA3', maxAtomic: '100000' });
 export const BASE_SOURCE = `function createCheckout() {
@@ -21,19 +22,53 @@ export function assertTestnetOffer(offer) {
 }
 export function assertQuote(quote) {
   const q = quote?.accepts?.[0];
-  if (!q || q.scheme !== 'upto' || q.network !== 'eip155:10143' || String(q.asset).toLowerCase() !== NETWORK.asset.toLowerCase() || String(q.payTo).toLowerCase() !== NETWORK.payTo.toLowerCase() || BigInt(q.amount) < 0n || BigInt(q.amount) > BigInt(NETWORK.maxAtomic) || q.extra?.assetTransferMethod !== 'permit2' || !Number.isInteger(q.maxTimeoutSeconds) || q.maxTimeoutSeconds <= 0 || q.maxTimeoutSeconds > 900) throw new Error('Payment quote is outside the pinned testnet limit');
+  if (!q) throw new Error('Payment quote is missing');
+  if (q.scheme !== 'upto' || q.network !== 'eip155:10143' || String(q.asset).toLowerCase() !== NETWORK.asset.toLowerCase() || String(q.payTo).toLowerCase() !== NETWORK.payTo.toLowerCase()) throw new Error('Payment quote uses the wrong Monad testnet rail');
+  if (BigInt(q.amount) < 0n || BigInt(q.amount) > BigInt(NETWORK.maxAtomic)) throw new Error('Payment quote exceeds the pinned 0.1 test USDC limit');
+  if (q.extra?.assetTransferMethod !== 'permit2') throw new Error('Payment quote does not use Permit2');
+  // The staging merchant advertises a one-hour quote. This is still bounded by
+  // the single-request amount ceiling; rejecting it at 15 minutes caused a
+  // valid quote to be reported as a price violation.
+  if (!Number.isInteger(q.maxTimeoutSeconds) || q.maxTimeoutSeconds <= 0 || q.maxTimeoutSeconds > 3600) throw new Error('Payment quote timeout exceeds the one-hour testnet limit');
 }
 export function walletTypedData(payload) {
   if (!['Policy', 'ReservationIntent', 'PermitWitnessTransferFrom'].includes(payload.primaryType) || Number(payload.domain?.chainId) !== NETWORK.chainId) throw new Error('Unsupported wallet signing request');
   const fields = [['name', 'string'], ['version', 'string'], ['chainId', 'uint256'], ['verifyingContract', 'address'], ['salt', 'bytes32']];
   return serialize({ ...payload, types: { EIP712Domain: fields.filter(([name]) => payload.domain[name] !== undefined).map(([name, type]) => ({ name, type })), ...payload.types } });
 }
-export function createOperatorApp({ port, fetcher = fetch, rpc = createPublicClient({ chain: monadTestnet, transport: http(NETWORK.rpc) }) }) {
+export function validateRecoveryChallenge(payload, url, purchaseId, now = Date.now()) {
+  const extension = payload?.extensions?.['sign-in-with-x'];
+  const info = extension?.info;
+  const target = new URL(url);
+  if (target.origin !== NETWORK.merchant || !['reconciliation', 'result'].some(part => target.pathname === `/api/agentpay/v1/purchases/${purchaseId}/${part}`) || info?.domain !== target.host || info?.uri !== url || info?.requestId !== purchaseId || info?.version !== '1' || info?.statement !== 'Recover this AgentPay purchase result' || !/^[a-zA-Z0-9]{8,128}$/.test(info?.nonce || '') || !extension.supportedChains?.some(chain => chain.chainId === 'eip155:10143' && chain.type === 'eip191')) throw new Error('Recovery challenge does not match this purchase and merchant');
+  const expiry = Date.parse(info.expirationTime), issued = Date.parse(info.issuedAt);
+  if (!Number.isFinite(expiry) || !Number.isFinite(issued) || expiry <= now || issued > now + 60000 || expiry > now + 600000) throw new Error('Merchant recovery challenge is expired or has an invalid lifetime. Merchant must issue a fresh challenge; do not start another purchase.');
+  return { ...info, chainId: 'eip155:10143', type: 'eip191' };
+}
+export function reconciliationStatus(state) {
+  if (state === 'reserved') return 'reserved-no-payment';
+  if (['executed_unpaid', 'failed_unsettled', 'reservation_expired'].includes(state)) return 'stopped';
+  if (state === 'execution_unknown') return 'execution-unknown';
+  return 'pending';
+}
+export function createOperatorApp({ port, fetcher = fetch, initialPurchase = null, signatureTimeoutMs = 180000, rpc = createPublicClient({ chain: monadTestnet, transport: http(NETWORK.rpc) }) }) {
   const app = express();
   const token = randomBytes(24).toString('hex');
   const session = { status: 'idle', events: [], wallet: null, pending: null, evidence: null };
   let privateProgress = null, client = null, purchaseId = null, resolveSignature = null, rejectSignature = null, signatureTimer = null;
+  let policyRetryAllowed = false, reservationDispatched = false;
   const log = message => session.events.push({ at: new Date().toISOString(), message });
+  if (initialPurchase) {
+    if (!/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i.test(initialPurchase.purchaseId || '') || !/^0x[0-9a-f]{40}$/i.test(initialPurchase.wallet || '')) throw new Error('Recovery requires a purchase UUID and wallet address');
+    purchaseId = initialPurchase.purchaseId; session.purchaseId = purchaseId; session.wallet = initialPurchase.wallet; session.status = 'recovery-required';
+    log('Attached existing purchase for read-only recovery. Creating a new purchase is disabled.');
+    // Operator-only migration for a verified local Policy timeout. Never use
+    // this mode for reservations, submitted signatures or unknown outcomes.
+    if (initialPurchase.mode === 'policy-timeout') {
+      policyRetryAllowed = true; session.status = 'signature-timeout';
+      log('Restored a verified Policy timeout before reservation. Retry retains this purchase ID.');
+    }
+  }
   app.use((req, res, next) => {
     const actualPort = typeof port === 'function' ? port() : port;
     const origin = `http://127.0.0.1:${actualPort}`;
@@ -51,12 +86,18 @@ export function createOperatorApp({ port, fetcher = fetch, rpc = createPublicCli
     res.set('Content-Security-Policy', "default-src 'none'; script-src 'unsafe-eval'; connect-src 'none'; worker-src 'none'");
     res.sendFile(fileURLToPath(new URL('./evaluate-worker.js', import.meta.url)));
   });
-  const requestSignature = payload => new Promise((resolve, reject) => {
+  const requestSignature = payload => queueSignature({ typedData: walletTypedData(payload) }, payload.primaryType);
+  const queueSignature = (request, title) => new Promise((resolve, reject) => {
+    if (session.pending) return reject(new Error('A wallet request is already pending'));
     const id = randomUUID();
-    session.pending = { id, typedData: walletTypedData(payload) };
+    session.pending = { id, expiresAt: Date.now() + signatureTimeoutMs, ...request };
     resolveSignature = resolve; rejectSignature = reject;
-    log(`Awaiting wallet signature: ${payload.primaryType}`);
-    signatureTimer = setTimeout(() => { session.pending = null; resolveSignature = null; rejectSignature = null; reject(new Error('Wallet signature timed out. No automatic retry.')); }, 180000);
+    log(`Awaiting wallet signature: ${title}`);
+    signatureTimer = setTimeout(() => {
+      session.pending = null; resolveSignature = null; rejectSignature = null;
+      if (request.typedData?.primaryType === 'Policy' && !reservationDispatched && !session.paymentDispatched) policyRetryAllowed = true;
+      reject(Object.assign(new Error('Wallet signature timed out. No automatic retry.'), { code: 'wallet_signature_timeout' }));
+    }, signatureTimeoutMs);
   });
   app.post('/api/signature', (req, res) => {
     if (!session.pending || req.body.id !== session.pending.id) return res.status(409).json({ error: 'No matching signature request' });
@@ -81,13 +122,29 @@ export function createOperatorApp({ port, fetcher = fetch, rpc = createPublicCli
       res.json({ ...funds, ready: true, approval: { from: wallet, to: NETWORK.asset, value: '0x0', data: encodeFunctionData({ abi: erc20Abi, functionName: 'approve', args: [NETWORK.permit2, BigInt(NETWORK.maxAtomic)] }) } });
     } catch (error) { res.status(422).json({ error: error.message }); }
   });
-  async function collectEvidence() {
-    if (!privateProgress) throw new Error('No reservation recovery token available; do not issue a second purchase');
-    const reconciliation = await client.getReconciliation({ purchaseId, progressToken: privateProgress });
-    if (reconciliation.state !== 'matched') { session.status = 'pending'; log(`Settlement remains ${reconciliation.state}`); return; }
-    const resultResponse = await fetcher(`${NETWORK.merchant}/api/agentpay/v1/purchases/${purchaseId}/result`, { headers: { authorization: `Bearer ${privateProgress}` }, signal: AbortSignal.timeout(20000) });
-    if (!resultResponse.ok) throw new Error('Matched purchase result not yet available');
-    const result = await resultResponse.json();
+  async function readPurchase(part, recover = false) {
+    const url = `${NETWORK.merchant}/api/agentpay/v1/purchases/${purchaseId}/${part}`;
+    let response = await fetcher(url, { headers: privateProgress ? { authorization: `Bearer ${privateProgress}` } : {}, signal: AbortSignal.timeout(20000) });
+    let data = await response.json();
+    if (response.status === 402 && data.code === 'access_token_lost') {
+      if (!recover) { const error = new Error('Purchase access expired. Use Recover purchase access; no new payment is needed.'); error.code = 'access_token_lost'; throw error; }
+      const info = validateRecoveryChallenge(data, url, purchaseId);
+      const payload = await createSIWxPayload(info, { address: session.wallet, signMessage: ({ message }) => queueSignature({ message }, 'Recover purchase access (not a payment)') }, url);
+      response = await fetcher(url, { headers: { 'sign-in-with-x': encodeSIWxHeader(payload) }, signal: AbortSignal.timeout(20000) });
+      data = await response.json();
+    }
+    if (!response.ok) throw new Error(`Purchase ${part} unavailable (${response.status}); keep the same purchase`);
+    if (data.purchaseId !== purchaseId) throw new Error('Merchant returned a different purchase');
+    return data;
+  }
+  async function collectEvidence(recover = false) {
+    const reconciliation = await readPurchase('reconciliation', recover);
+    if (reconciliation.state !== 'matched') {
+      session.status = reconciliationStatus(reconciliation.state);
+      log(reconciliation.state === 'reserved' ? 'Reservation only: payment has not been submitted. Reconciliation does not execute or pay for a reservation.' : `Settlement remains ${reconciliation.state}`);
+      return;
+    }
+    const result = await readPurchase('result', recover);
     const proofId = result.proofId || result.receipt?.proofId;
     if (!/^proof_[a-z0-9]+$/i.test(proofId || '')) throw new Error('No public proof ID returned');
     const proofUrl = `${NETWORK.merchant}/api/agentpay/v1/proofs/${proofId}`;
@@ -110,7 +167,7 @@ export function createOperatorApp({ port, fetcher = fetch, rpc = createPublicCli
       if (!readyResponse.ok || !ready.ok || ready.mode !== 'live-capable' || ready.provider?.mode !== 'zhipu') throw new Error('Live provider readiness failed');
       const funds = await balances(wallet);
       if (BigInt(funds.balance) < BigInt(NETWORK.maxAtomic) || BigInt(funds.allowance) < BigInt(NETWORK.maxAtomic)) throw new Error('At least 0.1 test USDC balance and Permit2 allowance are required');
-      const discovery = createAiplansDiscovery({ toolkitBaseUrl: NETWORK.merchant, baseUrl: 'https://aiplans.dev' });
+      const discovery = createAiplansDiscovery({ toolkitBaseUrl: NETWORK.merchant, baseUrl: 'https://aiplans.dev', fetch: fetcher });
       const offers = await discovery.listOffers();
       const offer = offers.find(o => o.offerId === 'toolkit-zhipu-glm-flash');
       assertTestnetOffer(offer);
@@ -118,18 +175,33 @@ export function createOperatorApp({ port, fetcher = fetch, rpc = createPublicCli
       const signer = { address: wallet, signTypedData: requestSignature };
       log('Checkpoint and public repair prompt prepared. Owner and agent use the connected wallet in this operator-assisted run.');
       const policySignature = await signProcurementPolicy(policy, signer);
+      let paymentDispatched = false;
       const signedFetch = async (url, init) => {
+        if (String(url).endsWith('/reservations') && init?.method === 'POST') reservationDispatched = true;
+        if (new Headers(init?.headers).has('payment-signature')) { paymentDispatched = true; session.paymentDispatched = true; }
         const response = await fetcher(url, { ...init, signal: AbortSignal.timeout(45000) });
         if (String(url).endsWith('/reservations') && response.ok) privateProgress = (await response.clone().json()).progressToken;
         return response;
       };
       client = createAgentPay({ policy, policySignature, discovery, baseUrl: NETWORK.merchant, fetch: signedFetch });
       const signPayment = await createX402PaymentSigner({ signer, rpcUrl: NETWORK.rpc });
-      const purchase = await client.buy({ purchaseId, policyId: policy.policyId, offer, body: { prompt: PROMPT }, inputTokens: 2048, outputCap: 1024, signReservation: intent => signReservationIntent(intent, signer), signPayment: quote => { assertQuote(quote); return signPayment(quote); }, waitForSettlement: true, settlementTimeoutMs: 45000 });
+      let purchase;
+      try {
+        purchase = await client.buy({ purchaseId, policyId: policy.policyId, offer, body: { prompt: PROMPT }, inputTokens: 2048, outputCap: 1024, signReservation: intent => signReservationIntent(intent, signer), signPayment: quote => { assertQuote(quote); return signPayment(quote); }, waitForSettlement: true, settlementTimeoutMs: 45000 });
+      } catch (error) {
+        session.status = paymentDispatched ? 'pending' : 'blocked-before-payment';
+        log(`${paymentDispatched ? 'Execution outcome needs reconciliation' : 'Stopped before payment dispatch'}: ${error.message}`);
+        return;
+      }
       privateProgress = purchase.reservation.progressToken || privateProgress;
       if (purchase.status === 'pending') { session.status = 'pending'; log('Settlement pending; reconcile this purchase, not a new one.'); return; }
       await collectEvidence();
-    } catch (error) { session.status = privateProgress ? 'pending' : 'stopped'; log(`Stopped: ${error.message}`); }
+    } catch (error) {
+      session.status = error.code === 'access_token_lost' ? 'recovery-required'
+        : error.code === 'wallet_signature_timeout' && policyRetryAllowed ? 'signature-timeout'
+          : session.paymentDispatched ? 'pending' : 'stopped';
+      log(`Stopped: ${error.message}`);
+    }
   }
   app.post('/api/start', (req, res) => {
     if (session.status !== 'idle') return res.status(409).json({ error: 'One purchase per operator session. Existing purchase must be reconciled, not repeated.' });
@@ -139,11 +211,25 @@ export function createOperatorApp({ port, fetcher = fetch, rpc = createPublicCli
     void run(session.wallet);
     res.json({ ok: true, purchaseId });
   });
+  app.post('/api/retry-signature', (req, res) => {
+    if (!purchaseId || !policyRetryAllowed || reservationDispatched || session.paymentDispatched || session.pending || session.status !== 'signature-timeout' || String(req.body.wallet).toLowerCase() !== String(session.wallet).toLowerCase()) return res.status(409).json({ error: 'Only the original wallet can retry a Policy timeout before reservation or payment' });
+    policyRetryAllowed = false;
+    session.status = 'running';
+    log('Retrying the timed-out wallet signature for the same purchase; no new reservation or payment.');
+    void run(session.wallet);
+    res.json({ ok: true, purchaseId });
+  });
   app.post('/api/reconcile', async (_req, res) => {
-    if (!client || !privateProgress || session.status !== 'pending') return res.status(409).json({ error: 'No pending purchase to reconcile' });
+    if (!purchaseId || !['pending', 'blocked-before-payment', 'reserved-no-payment', 'execution-unknown'].includes(session.status)) return res.status(409).json({ error: 'No purchase available to reconcile; check whether wallet recovery is required' });
     session.status = 'reconciling';
     try { await collectEvidence(); res.json({ ok: true }); }
-    catch (error) { session.status = 'pending'; log(error.message); res.status(422).json({ error: error.message }); }
+    catch (error) { session.status = error.code === 'access_token_lost' ? 'recovery-required' : 'pending'; log(error.message); res.status(422).json({ error: error.message }); }
+  });
+  app.post('/api/recover', (req, res) => {
+    if (!purchaseId || !['recovery-required', 'recovery-blocked'].includes(session.status) || String(req.body.wallet).toLowerCase() !== session.wallet.toLowerCase()) return res.status(409).json({ error: 'Connect the original purchase wallet before recovery' });
+    session.status = 'recovering';
+    void collectEvidence(true).catch(error => { session.status = 'recovery-blocked'; log(error.message); });
+    res.json({ ok: true });
   });
   app.post('/api/tests', (req, res) => {
     if (!session.evidence || !['paid-awaiting-tests', 'complete', 'test-failed'].includes(session.status)) return res.status(409).json({ error: 'No matched provider output' });
@@ -162,6 +248,8 @@ export function createOperatorApp({ port, fetcher = fetch, rpc = createPublicCli
 }
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
   const port = Number(process.env.OPERATOR_PORT || 4022);
-  const { app } = createOperatorApp({ port });
+  const initialPurchase = process.env.OPERATOR_RECOVER_PURCHASE ? { purchaseId: process.env.OPERATOR_RECOVER_PURCHASE, wallet: process.env.OPERATOR_RECOVER_WALLET } : null;
+  if (initialPurchase && process.env.OPERATOR_RESTORE_POLICY_TIMEOUT === '1') initialPurchase.mode = 'policy-timeout';
+  const { app } = createOperatorApp({ port, initialPurchase });
   app.listen(port, '127.0.0.1', () => console.log(`AgentPay wallet operator: http://127.0.0.1:${port}/ (testnet only; no purchase until explicitly started)`));
 }

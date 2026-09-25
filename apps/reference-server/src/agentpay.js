@@ -64,11 +64,14 @@ async function canReadPurchase(req, purchase) {
   try {
     const payload = parseSIWxHeader(header);
     const origin = new URL(`${req.protocol}://${req.get('host')}`);
+    if (payload.uri !== `${origin.origin}${req.originalUrl}` || payload.requestId !== purchase.purchaseId || payload.chainId !== 'eip155:10143') return false;
     const validation = await validateSIWxMessage(payload, origin, { checkNonce: (nonce) => nonce === purchase.accessNonce && !purchase.accessNonceUsed });
     if (!validation.isValid) return false;
     const verified = await verifySIWxSignature(payload);
     if (!verified.isValid) return false;
-    const expectedPayer = purchase.authorization?.payer || purchase.authorization?.from || purchase.agentWallet;
+    const storedPolicy = await purchaseService.getPolicy(purchase.policyId);
+    const expectedPayer = purchase.authorization?.payer || purchase.authorization?.from
+      || (/^0x[0-9a-f]{40}$/i.test(purchase.agentWallet || '') ? purchase.agentWallet : storedPolicy?.agentWallet);
     if (!expectedPayer || String(verified.payer).toLowerCase() !== String(expectedPayer).toLowerCase()) return false;
     return purchaseService.consumeAccessNonce(purchase.purchaseId, payload.nonce);
   } catch { return false; }
@@ -90,7 +93,9 @@ function recoveryChallenge(req, purchase) {
   };
 }
 
-function accessChallenge(res, req, purchase) {
+async function accessChallenge(res, req, purchase) {
+  purchase = await purchaseService.ensureAccessNonce(purchase.purchaseId);
+  res.set('Cache-Control', 'no-store');
   return res.status(402).json({
     type: 'https://toolkit.fun/problems/agentpay/access_token_lost',
     title: 'Purchase access requires wallet recovery',
@@ -216,6 +221,7 @@ export function registerAgentPayRoutes(app) {
         purchaseId, policyId: req.params.policyId, offer, request: body.request || { prompt: 'Build a Monad demo' },
         requestDigest: body.requestDigest || hash(body.request || {}), inputTokens: body.inputTokens, outputCap: body.outputCap,
         maximumAtomic: offer.x402MaxAtomic, policy: body.policy,
+        agentWallet: body.policy?.agentWallet,
         progressTokenHash: hash(progressToken),
       });
       const response = {

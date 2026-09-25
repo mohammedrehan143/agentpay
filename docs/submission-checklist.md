@@ -61,3 +61,26 @@ checks found the staging service live-capable and the existing proof matched.
 The browser wallet path avoids the missing environment signing key. Completion
 still depends on the owner's wallet connection, funds, signatures, matched
 settlement and passing tests of the actual generated output.
+
+### Operator recovery boundary
+
+The operator distinguishes a reservation without payment from settlement pending,
+and exposes wallet-assisted access recovery rather than repeatedly polling an
+expired bearer token. Recovery validates merchant, purchase, chain and challenge
+lifetime before requesting a message signature; it never creates or pays an order.
+To attach an existing purchase after a local restart, set
+`OPERATOR_RECOVER_PURCHASE` (UUID) and `OPERATOR_RECOVER_WALLET` (public address)
+when running `npm run operator`. New purchases are disabled in this mode.
+Private tokens and signatures are not persisted to disk.
+
+September 7 live investigation: staging returned a 3,599-second quote with the
+correct 100,000-atomic ceiling; the former 900-second guard incorrectly rejected
+it. The quote timeout guard now accepts the merchant's bounded one-hour offer;
+the amount ceiling remains 0.1 test USDC. The old purchase's recovery challenge
+was also already expired. The operator fails closed on that response. Staging
+must issue fresh purchase-scoped challenges before that old purchase can be
+recovered. The reference merchant now renews expired or consumed challenges
+with a compare-and-set update, preserves active challenges, rejects reuse and
+binds signatures to the exact purchase, route and chain. Legacy reservations
+can resolve their wallet from the stored policy. Deployment and live recovery
+still require separate verification; local tests do not prove a live repair.

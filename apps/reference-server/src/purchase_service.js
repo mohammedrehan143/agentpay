@@ -273,6 +273,32 @@ export class AgentPayPurchaseService {
     if (!this.useMongo) return this.clone(this.memory.get(String(purchaseId)) || null);
     return this.collection().findOne({ purchaseId });
   }
+  async ensureAccessNonce(purchaseId) {
+    const id = String(purchaseId);
+    const current = await this.get(id);
+    if (!current) throw conflict('purchase_not_found', 'Purchase not found');
+    const timestamp = this.clock();
+    if (current.accessNonce && !current.accessNonceUsed && new Date(current.accessNonceExpiresAt).getTime() > timestamp) return current;
+    const fields = {
+      accessNonce: crypto.randomBytes(16).toString('hex'),
+      accessNonceUsed: false,
+      accessNonceExpiresAt: new Date(timestamp + 300000),
+    };
+    if (!this.useMongo) {
+      const record = this.memory.get(id);
+      // Another challenge request may have renewed the nonce while get() yielded.
+      if (!record.accessNonce || record.accessNonceUsed || new Date(record.accessNonceExpiresAt).getTime() <= timestamp) Object.assign(record, fields);
+      return this.clone(record);
+    }
+    // Compare-and-set preserves an in-flight challenge when requests race.
+    await this.collection().updateOne({
+      purchaseId: id,
+      accessNonce: current.accessNonce ?? null,
+      accessNonceUsed: current.accessNonceUsed ?? null,
+      accessNonceExpiresAt: current.accessNonceExpiresAt ?? null,
+    }, { $set: fields });
+    return this.get(id);
+  }
   async consumeAccessNonce(purchaseId, nonce) {
     const value = String(nonce || '');
     if (!value) return false;
