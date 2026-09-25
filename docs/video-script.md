@@ -1,5 +1,39 @@
 # AgentPay Walkthrough
 
+## Current release: real paid repair
+
+The first video on the [public brief](https://x2v-co.github.io/agentpay/brief.html)
+reviews the completed September 10 purchase: OpenRouter generated the unchanged
+repair, all three isolated browser tests passed, and 220 tokens settled for
+0.000033 test USDC. The 54.2-second recording has English captions and is pinned
+with the evidence in [v0.2.0](https://github.com/x2v-co/agentpay/releases/tag/v0.2.0).
+It is a retrospective evidence walkthrough, not original wallet-signing footage.
+Tests are owner-reported, not cryptographic execution attestations.
+
+The public player also offers `assets/live-repair.zh.vtt` as optional Simplified
+Chinese captions. The Chinese introduction selects that track by default. The
+original video includes English on-screen captions; its released bytes and
+English subtitle track remain unchanged. New Chinese subtitles are supplemental
+website material, not part of the pinned v0.2.0 evidence assets.
+
+To record a new walkthrough of the saved evidence, start `npm run dev`, then run
+the following in another terminal with a locally installed Playwright browser:
+
+```bash
+CAPTURE_DIR="$(mktemp -d /tmp/agentpay-evidence-video.XXXXXX)" \
+EVIDENCE_URL=http://127.0.0.1:4021/agentpay/live-repair.html \
+node scripts/capture-live-repair.mjs
+```
+
+Set `PLAYWRIGHT_MODULE` to a module name or absolute ESM module path if needed.
+`CAPTURE_DIR` must be absolute. The script verifies the output digest, three saved
+passing results, mobile layout and page errors, then writes `live-repair.webm`,
+`live-repair.vtt`, `evidence-desktop.png` and `verification.json`. It makes no new
+inference or payment. Keep new recordings separate from the immutable v0.2.0
+assets and checksums. Verify playback before publishing.
+
+## Historical interactive simulation
+
 The published video is a recording of the interactive demo. English captions are
 provided as a WebVTT track. It contains no new model call or blockchain transaction.
 The code walkthrough and historical receipt are intentionally separate.
