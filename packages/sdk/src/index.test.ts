@@ -65,7 +65,7 @@ describe('AgentPay discovery', () => {
       calls.push({ url, payment: String((init.headers as Record<string, string> | undefined)?.['payment-signature'] || ''), body: init.body ? JSON.parse(String(init.body)) : null });
       if (url.includes('/reservations')) return new Response(JSON.stringify({ reservationReceipt: { reservationId: 'r1' } }), { status: 200 });
       if (!calls.at(-1)?.payment) return new Response(JSON.stringify({ status: 402, code: 'settlement_pending' }), { status: 402 });
-      return new Response(JSON.stringify({ purchaseId: 'p1', receipt: { status: 'paid' } }), { status: 200 });
+      return new Response(JSON.stringify({ purchaseId: 'p1', receipt: { status: 'paid', actualAtomic: '1', proofId: 'proof_p1' } }), { status: 200 });
     };
     const client = createAgentPay({
       policy: { schema: 'agentpay.policy.v1', policyId: '0x0000000000000000000000000000000000000000000000000000000000000001', owner: '0x0000000000000000000000000000000000000002', agentWallet: '0x0000000000000000000000000000000000000003', chainId: 10143, asset: '0x0000000000000000000000000000000000000004', maxTotalAtomic: '100', maxPerRequestAtomic: '100', allowedPayTo: [payTo], allowedModels: ['zhipu/GLM-4.7-Flash'], validUntil: 4_000_000_000 },
@@ -114,6 +114,26 @@ describe('AgentPay discovery', () => {
     expect(first.requestDigest).not.toBe(second.requestDigest);
   });
 
+  it('rejects token bounds that the selected offer cannot fulfill', () => {
+    const client = createAgentPay({ policy: policyForSigning, discovery: { listModels: async () => [], listOffers: async () => [] } });
+    expect(() => client.preflight(offer({ maxInputTokens: 5 }), 10, 1, { prompt: 'a' })).toThrow(/token bounds/i);
+  });
+
+  it('does not report a matched purchase without a paid receipt and proof identifier', async () => {
+    const selected = offer({ x402MaxAtomic: '100' });
+    const client = createAgentPay({
+      policy: policyForSigning,
+      discovery: { listModels: async () => [{ providerSlug: 'zhipu', modelSlug: 'GLM-4.7-Flash', currency: 'USD', unit: '1M tokens' }], listOffers: async () => [selected] },
+      fetch: (async (url: string, init: RequestInit = {}) => {
+        if (url.includes('/reservations')) return new Response(JSON.stringify({ reservationReceipt: { reservationId: 'r1' } }), { status: 200 });
+        if (!new Headers(init.headers).get('payment-signature')) return new Response(JSON.stringify({}), { status: 402 });
+        return new Response(JSON.stringify({ purchaseId: 'wrong-purchase', receipt: { status: 'paid' } }), { status: 200 });
+      }) as typeof fetch,
+      baseUrl: 'http://demo.test',
+    });
+    await expect(client.buy({ body: { prompt: 'hello' }, inputTokens: 1, outputCap: 1, policyId: policyForSigning.policyId })).rejects.toMatchObject({ problem: { code: 'settlement_unknown' } });
+  });
+
   it('rejects an explicit offer that discovery did not approve', async () => {
     const client = createAgentPay({
       policy: policyForSigning,
@@ -133,7 +153,7 @@ describe('AgentPay discovery', () => {
       fetch: async (url, init = {}) => {
         if (String(url).includes('/reservations')) { bodies.push(JSON.parse(String(init.body))); return new Response(JSON.stringify({ reservationReceipt: { reservationId: 'r1' } }), { status: 200 }); }
         if (!bodies.length || !String((init.headers as Record<string, string> | undefined)?.['payment-signature'] || '')) return new Response(JSON.stringify({}), { status: 402 });
-        return new Response(JSON.stringify({ purchaseId: '550e8400-e29b-41d4-a716-446655440000' }), { status: 200 });
+        return new Response(JSON.stringify({ purchaseId: '550e8400-e29b-41d4-a716-446655440000', receipt: { status: 'paid', actualAtomic: '1', proofId: 'proof_test' } }), { status: 200 });
       },
       baseUrl: 'http://demo.test',
     });

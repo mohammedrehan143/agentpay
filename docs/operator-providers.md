@@ -1,16 +1,29 @@
 # Explicit provider selection for live repair acceptance
 
-The operator defaults to the existing Zhipu GLM-4.7-Flash route. To prepare the supported OpenRouter route on a separate local port:
+The operator defaults to the existing Zhipu GLM-4.7-Flash route. The static
+OpenRouter repair is historical evidence; this checkout does not claim an
+OpenRouter live route unless the merchant discovery feed and readiness checks
+are explicitly extended for it.
 
 ```sh
-OPERATOR_PORT=4024 OPERATOR_PROVIDER=openrouter npm run operator
+npm run operator
 ```
 
-Open `http://127.0.0.1:4024/` in Chrome with MetaMask enabled. Use a free port; if an operator is already running, preserve its existing purchase rather than restarting it. The page displays the selected provider and model before purchase consent. Only `zhipu` and `openrouter` are supported. There is no automatic fallback and no automatic repurchase.
+Open `http://127.0.0.1:4022/` in Chrome with MetaMask enabled. Use a free
+port only when starting a separate session; if an operator is already running,
+preserve its existing purchase rather than restarting it. The page displays the
+selected provider and model before purchase consent. There is no automatic
+fallback and no automatic repurchase.
 
-Both routes remain pinned to the existing staging merchant, Monad Testnet (10143), USDC asset and 0.1 test USDC ceiling. The provider selects the readiness query, exact offer route, signed policy model and public proof identity together. Changing the environment requires a separate process; never restart a process while its purchase is pending.
+The live route is pinned to the existing staging merchant, Monad Testnet
+(10143), USDC asset and 0.1 test USDC ceiling. The provider selection binds the
+readiness query, exact offer route, signed policy model and public proof
+identity together. Never infer a provider change from an environment variable
+that the merchant did not advertise.
 
-OpenRouter uses `z-ai/glm-5.3-flash`. Its aiplans catalog product is `glm-5.3-flash`; the SDK maps only this exact OpenRouter identity. Batch and other-provider records do not match.
+The SDK still contains a strict OpenRouter catalog alias for clients that are
+configured against a compatible merchant. Batch and other-provider records do
+not match. The bundled operator intentionally does not select that route.
 
 Before this change, the September 10 Zhipu attempt `43a1b8f2-df43-43ad-b532-ac9533cbc855` received provider HTTP 429 and reconciled to `failed_unsettled`. That attempt is not evidence of a completed repair or payment. Selecting OpenRouter prepares a different purchase requiring fresh wallet signatures.
 
@@ -26,7 +39,11 @@ Once a reservation or payment may have been sent, use **Reconcile same purchase*
 instead. **Recover purchase access** validates the merchant's purchase-bound,
 expiring sign-in challenge and requests a message signature, not another payment.
 
-Validation: `npm test` checks policy model binding for both providers, route and amount rejection, exact catalog mapping, signature timeout/recovery boundaries, and the existing SDK/protocol/demo tests. A passing test suite does not establish a successful live paid repair.
+Validation: `npm test` checks policy model binding and strict catalog mapping,
+route and amount rejection, signature timeout/recovery boundaries, the
+server-owned repair sandbox, reconciliation, and the existing
+SDK/protocol/demo tests. A passing test suite does not establish a successful
+live paid repair.
 
 The subsequent September 10 purchase `e69e6208-2429-4f48-b2f3-5efd725e3dab` completed real acceptance: 220 tokens, 0.000033 test USDC settled and all three tests passed on unchanged output. Inspect its [saved evidence](../apps/demo/assets/live-repair.json) without starting a new purchase.
 

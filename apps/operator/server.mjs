@@ -1,20 +1,16 @@
 import express from 'express';
+import path from 'node:path';
 try { process.loadEnvFile?.(); } catch {}
 import { randomBytes, randomUUID, createHash } from 'node:crypto';
 import { createPublicClient, http, erc20Abi, encodeFunctionData, parseEventLogs } from 'viem';
 import { monadTestnet } from 'viem/chains';
-import { createAgentPay, createAiplansDiscovery, createX402PaymentSigner, signProcurementPolicy, signReservationIntent } from '@toolkitfun/agentpay-sdk';
+import { createAgentPay, createAiplansDiscovery, createX402PaymentSigner, joinDiscovery, signProcurementPolicy, signReservationIntent } from '@toolkitfun/agentpay-sdk';
 import { fileURLToPath } from 'node:url';
 import { createSIWxPayload, encodeSIWxHeader } from '@x402/extensions/sign-in-with-x';
+import { BASE_SOURCE, buildEvidenceMarkdown, runCheckoutInSandbox, runRepairVerification } from './repair-sandbox.mjs';
+export { BASE_SOURCE };
 
 export const NETWORK = Object.freeze({ chainId: 10143, rpc: 'https://testnet-rpc.monad.xyz', merchant: 'https://staging.toolkit.fun', asset: '0x534b2f3A21130d7a60830c2Df862319e593943A3', payTo: '0x16E0e71068eb63140aEB56678d6840982b7AFbB1', permit2: '0x000000000022D473030F116dDEE9F6B43aC78BA3', maxAtomic: '100000' });
-export const BASE_SOURCE = `function createCheckout() {
-  const receipts = new Map(); let charges = 0;
-  return {
-    pay(key) { const receipt = { id: 'receipt-' + (++charges), key }; receipts.set(key, receipt); return receipt; },
-    get charges() { return charges; }
-  };
-}`;
 const PROMPT = `Fix this JavaScript checkout so retrying the same key returns the original receipt without a second charge. Different keys must still charge separately. Return ONLY plain JavaScript starting with function createCheckout(), no markdown, imports, exports, networking or explanations. Preserve the pay(key) and charges interface.\n${BASE_SOURCE}`;
 const digest = value => createHash('sha256').update(value).digest('hex');
 const serialize = value => JSON.parse(JSON.stringify(value, (_, v) => typeof v === 'bigint' ? v.toString() : v));
@@ -55,7 +51,7 @@ export function reconciliationStatus(state) {
 export function createOperatorApp({ port, fetcher = fetch, initialPurchase = null, signatureTimeoutMs = 180000, rpc = createPublicClient({ chain: monadTestnet, transport: http(NETWORK.rpc) }) }) {
   const app = express();
   const token = randomBytes(24).toString('hex');
-  const session = { status: 'idle', events: [], wallet: null, pending: null, evidence: null };
+  const session = { status: 'idle', events: [], wallet: null, pending: null, evidence: null, baseline: null, selectedProvider: { provider: 'zhipu', model: 'GLM-4.7-Flash', route: '/api/agentpay/v1/models/zhipu/GLM-4.7-Flash/invoke' } };
   let privateProgress = null, client = null, purchaseId = null, resolveSignature = null, rejectSignature = null, signatureTimer = null;
   let policyRetryAllowed = false, reservationDispatched = false;
   const log = message => session.events.push({ at: new Date().toISOString(), message });
@@ -123,6 +119,14 @@ export function createOperatorApp({ port, fetcher = fetch, initialPurchase = nul
       res.json({ ...funds, ready: true, approval: { from: wallet, to: NETWORK.asset, value: '0x0', data: encodeFunctionData({ abi: erc20Abi, functionName: 'approve', args: [NETWORK.permit2, BigInt(NETWORK.maxAtomic)] }) } });
     } catch (error) { res.status(422).json({ error: error.message }); }
   });
+  app.post('/api/baseline', async (_req, res) => {
+    const verification = await runCheckoutInSandbox(BASE_SOURCE);
+    session.baseline = { ...verification, recordedAt: new Date().toISOString(), source: 'server disposable sandbox' };
+    log(verification.passed
+      ? 'Baseline unexpectedly passed; live procurement is blocked.'
+      : 'Original failing fixture executed in the disposable sandbox; retry test failed as expected.');
+    res.json(session.baseline);
+  });
   async function readPurchase(part, recover = false) {
     const url = `${NETWORK.merchant}/api/agentpay/v1/purchases/${purchaseId}/${part}`;
     let response = await fetcher(url, { headers: privateProgress ? { authorization: `Bearer ${privateProgress}` } : {}, signal: AbortSignal.timeout(20000) });
@@ -142,6 +146,10 @@ export function createOperatorApp({ port, fetcher = fetch, initialPurchase = nul
     const reconciliation = await readPurchase('reconciliation', recover);
     if (reconciliation.state !== 'matched') {
       session.status = reconciliationStatus(reconciliation.state);
+      if (session.execution) {
+        session.execution.payment.status = reconciliation.state === 'reserved' ? 'not_submitted' : reconciliation.state === 'failed_unsettled' ? 'rejected' : 'pending_reconciliation';
+        session.execution.outcome = reconciliation.state;
+      }
       log(reconciliation.state === 'reserved' ? 'Reservation only: payment has not been submitted. Reconciliation does not execute or pay for a reservation.' : `Settlement remains ${reconciliation.state}`);
       return;
     }
@@ -157,7 +165,9 @@ export function createOperatorApp({ port, fetcher = fetch, initialPurchase = nul
     const matched = chainReceipt.status === 'success' && transfers.some(t => t.address.toLowerCase() === NETWORK.asset.toLowerCase() && t.args.from.toLowerCase() === session.wallet.toLowerCase() && t.args.to.toLowerCase() === NETWORK.payTo.toLowerCase() && t.args.value === BigInt(proof.actualAtomic));
     if (!matched) throw new Error('Independent Monad transfer validation failed');
     if (typeof result.output !== 'string' || !result.output.trim() || result.output.length > 30000) throw new Error('Provider returned no bounded repair source');
-    session.evidence = { schema: 'agentpay.live-repair.v1', purchaseId, checkedAt: new Date().toISOString(), wallet: session.wallet, request: { prompt: PROMPT, inputEstimate: 2048, outputCap: 1024 }, baseline: BASE_SOURCE, rawOutput: result.output, outputSha256: digest(result.output), proofUrl, proof, chainVerified: true, tests: null, completed: false };
+    const usage = { ...proof.usage, actualAtomic: String(proof.actualAtomic) };
+    session.execution = { ...(session.execution || {}), taskId: purchaseId, purchaseId, mode: 'live', evidenceClass: 'live_execution', selectedModel: proof.model, provider: String(proof.model || '').split('/')[0], usage, payment: { ...(session.execution?.payment || {}), status: 'verified_settlement', transactionReference: proof.txHash, verification: 'public proof + independent Monad Transfer match' }, modelResponseDigest: digest(result.output), patch: result.output };
+    session.evidence = { schema: 'agentpay.live-repair.v1', purchaseId, taskId: purchaseId, policyId: session.execution?.policyId || null, checkedAt: new Date().toISOString(), mode: 'live', evidenceClass: 'live_execution', wallet: session.wallet, request: { prompt: PROMPT, inputEstimate: 2048, outputCap: 1024 }, baseline: session.baseline || { source: 'not captured' }, rawOutput: result.output, patch: result.output, outputSha256: digest(result.output), modelResponseDigest: digest(result.output), proofUrl, proof, usage, payment: session.execution?.payment || { status: 'verified_settlement', transactionReference: proof.txHash }, chainVerified: true, tests: null, completed: false };
     session.status = 'paid-awaiting-tests';
     log('Provider output recovered; public proof and independent Monad transfer matched. Run isolated tests next.');
   }
@@ -168,18 +178,22 @@ export function createOperatorApp({ port, fetcher = fetch, initialPurchase = nul
       if (!readyResponse.ok || !ready.ok || ready.mode !== 'live-capable' || ready.provider?.mode !== 'zhipu') throw new Error('Live provider readiness failed');
       const funds = await balances(wallet);
       if (BigInt(funds.balance) < BigInt(NETWORK.maxAtomic) || BigInt(funds.allowance) < BigInt(NETWORK.maxAtomic)) throw new Error('At least 0.1 test USDC balance and Permit2 allowance are required');
+      const policy = { schema: 'agentpay.policy.v1', policyId: `0x${randomBytes(32).toString('hex')}`, owner: wallet, agentWallet: wallet, chainId: NETWORK.chainId, asset: NETWORK.asset, maxTotalAtomic: NETWORK.maxAtomic, maxPerRequestAtomic: NETWORK.maxAtomic, allowedPayTo: [NETWORK.payTo], allowedModels: ['zhipu/GLM-4.7-Flash'], validUntil: Math.floor(Date.now() / 1000) + 900, requireHumanApproval: false };
+      session.execution = { taskId: purchaseId, purchaseId, policyId: policy.policyId, mode: 'live', evidenceClass: 'live_execution', selectedModel: 'zhipu/GLM-4.7-Flash', provider: 'zhipu', quotedPrice: { authorizedMaximum: NETWORK.maxAtomic, currency: 'atomic USDC' }, usage: null, payment: { status: 'not_submitted', transactionReference: null, verification: null }, modelResponseDigest: null, patch: null, acceptance: null, outcome: 'in_progress' };
       const discovery = createAiplansDiscovery({ toolkitBaseUrl: NETWORK.merchant, baseUrl: 'https://aiplans.dev', fetch: fetcher });
-      const offers = await discovery.listOffers();
-      const offer = offers.find(o => o.offerId === 'toolkit-zhipu-glm-flash');
+      const [models, offers] = await Promise.all([discovery.listModels(), discovery.listOffers()]);
+      const choice = joinDiscovery(models, offers, { policy, inputTokens: 2048, outputCap: 1024 });
+      session.execution.offerComparison = { candidates: choice.candidates, rejected: choice.rejected };
+      const offer = choice.recommended;
       assertTestnetOffer(offer);
-      const policy = { schema: 'agentpay.policy.v1', policyId: `0x${randomBytes(32).toString('hex')}`, owner: wallet, agentWallet: wallet, chainId: NETWORK.chainId, asset: NETWORK.asset, maxTotalAtomic: NETWORK.maxAtomic, maxPerRequestAtomic: NETWORK.maxAtomic, allowedPayTo: [NETWORK.payTo], allowedModels: ['zhipu/GLM-4.7-Flash'], validUntil: Math.floor(Date.now() / 1000) + 900 };
+      session.execution.selectedModel = `${offer.providerSlug}/${offer.modelSlug}`;
       const signer = { address: wallet, signTypedData: requestSignature };
       log('Checkpoint and public repair prompt prepared. Owner and agent use the connected wallet in this operator-assisted run.');
       const policySignature = await signProcurementPolicy(policy, signer);
       let paymentDispatched = false;
       const signedFetch = async (url, init) => {
         if (String(url).endsWith('/reservations') && init?.method === 'POST') reservationDispatched = true;
-        if (new Headers(init?.headers).has('payment-signature')) { paymentDispatched = true; session.paymentDispatched = true; }
+        if (new Headers(init?.headers).has('payment-signature')) { paymentDispatched = true; session.paymentDispatched = true; session.execution.payment.status = 'submitted'; session.execution.payment.submittedAt = new Date().toISOString(); }
         const response = await fetcher(url, { ...init, signal: AbortSignal.timeout(45000) });
         if (String(url).endsWith('/reservations') && response.ok) privateProgress = (await response.clone().json()).progressToken;
         return response;
@@ -198,6 +212,10 @@ export function createOperatorApp({ port, fetcher = fetch, initialPurchase = nul
       if (purchase.status === 'pending') { session.status = 'pending'; log('Settlement pending; reconcile this purchase, not a new one.'); return; }
       await collectEvidence();
     } catch (error) {
+      if (session.execution) {
+        session.execution.payment.status = session.paymentDispatched ? 'submitted_unverified' : 'not_submitted';
+        session.execution.outcome = session.paymentDispatched ? 'pending_reconciliation' : 'blocked_before_payment';
+      }
       session.status = error.code === 'access_token_lost' ? 'recovery-required'
         : error.code === 'wallet_signature_timeout' && policyRetryAllowed ? 'signature-timeout'
           : session.paymentDispatched ? 'pending' : 'stopped';
@@ -206,7 +224,7 @@ export function createOperatorApp({ port, fetcher = fetch, initialPurchase = nul
   }
   app.post('/api/start', (req, res) => {
     if (session.status !== 'idle') return res.status(409).json({ error: 'One purchase per operator session. Existing purchase must be reconciled, not repeated.' });
-    if (req.body.consent !== true || req.body.baselinePassed !== false || !/^0x[0-9a-fA-F]{40}$/.test(req.body.wallet || '')) return res.status(400).json({ error: 'Wallet, failed baseline and explicit testnet consent required' });
+    if (req.body.consent !== true || req.body.baselinePassed !== false || session.baseline?.passed !== false || !/^0x[0-9a-fA-F]{40}$/.test(req.body.wallet || '')) return res.status(400).json({ error: 'Wallet, server-recorded failed baseline and explicit testnet consent required' });
     session.wallet = req.body.wallet; purchaseId = randomUUID(); session.purchaseId = purchaseId; session.status = 'running';
     log(`New purchase ${purchaseId}; maximum 0.1 test USDC; no private key received.`);
     void run(session.wallet);
@@ -232,22 +250,32 @@ export function createOperatorApp({ port, fetcher = fetch, initialPurchase = nul
     void collectEvidence(true).catch(error => { session.status = 'recovery-blocked'; log(error.message); });
     res.json({ ok: true });
   });
-  app.post('/api/tests', (req, res) => {
+  app.post('/api/tests', async (req, res) => {
     if (!session.evidence || !['paid-awaiting-tests', 'complete', 'test-failed'].includes(session.status)) return res.status(409).json({ error: 'No matched provider output' });
-    const tests = req.body.tests;
-    if (!Array.isArray(tests) || tests.length !== 3 || tests.some(t => typeof t.pass !== 'boolean')) return res.status(400).json({ error: 'Three test results required' });
-    session.evidence.tests = tests.map((t, i) => ({ name: ['First request', 'Distinct keys', 'Retry reuses receipt'][i], pass: t.pass }));
-    session.evidence.testEnvironment = 'Operator browser Web Worker with network blocked; owner-reported test results, not a cryptographic test attestation';
-    session.evidence.completed = tests.every(t => t.pass);
+    const source = String(req.body?.source || session.evidence.rawOutput || '');
+    if (source !== String(session.evidence.rawOutput || '')) return res.status(409).json({ error: 'Generated patch is immutable and must match the paid model response digest' });
+    const verification = await runRepairVerification({ source, baselineSource: BASE_SOURCE });
+    const tests = verification.repair.tests;
+    session.evidence.verification = verification;
+    session.evidence.tests = tests;
+    session.evidence.patch = source;
+    session.evidence.testEnvironment = 'Server-owned disposable child process with Node permissions, network disabled, workspace and credential access denied';
+    session.evidence.completed = verification.baseline.requiredFailure && verification.repair.passed && Boolean(session.evidence.chainVerified);
+    session.execution = { ...(session.execution || {}), acceptance: tests, outcome: session.evidence.completed ? 'accepted' : 'rejected' };
     session.status = session.evidence.completed ? 'complete' : 'test-failed';
-    log(session.evidence.completed ? 'Generated provider output passed all three local tests.' : 'Paid model output failed acceptance. No replacement or automatic repurchase.');
-    res.json({ ok: true });
+    session.evidence.report = buildEvidenceMarkdown(session.evidence);
+    log(session.evidence.completed ? 'Generated provider output passed server-owned isolated acceptance tests.' : 'Generated repair failed isolated acceptance. No replacement or automatic repurchase.');
+    res.json({ ok: true, verification, tests, completed: session.evidence.completed });
+  });
+  app.get('/api/report', (_req, res) => {
+    if (!session.evidence?.report) return res.status(404).json({ error: 'No final evidence report is available' });
+    res.type('text/markdown').send(session.evidence.report);
   });
   app.use(express.static(fileURLToPath(new URL('./', import.meta.url)), { index: 'index.html', dotfiles: 'deny' }));
   app.use((error, _req, res, _next) => res.status(400).json({ error: 'Invalid operator request' }));
   return { app, dispose: () => { clearTimeout(signatureTimer); if (rejectSignature) rejectSignature(new Error('Operator stopped')); } };
 }
-if (process.argv[1] === fileURLToPath(import.meta.url)) {
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   const port = Number(process.env.OPERATOR_PORT || 4022);
   const initialPurchase = process.env.OPERATOR_RECOVER_PURCHASE ? { purchaseId: process.env.OPERATOR_RECOVER_PURCHASE, wallet: process.env.OPERATOR_RECOVER_WALLET } : null;
   if (initialPurchase && process.env.OPERATOR_RESTORE_POLICY_TIMEOUT === '1') initialPurchase.mode = 'policy-timeout';

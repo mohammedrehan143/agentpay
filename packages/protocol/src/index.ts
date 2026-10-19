@@ -173,6 +173,8 @@ export type ProcurementPolicy = {
   allowedPayTo: `0x${string}`[];
   allowedModels: string[];
   validUntil: number;
+  /** When true, a separate owner/operator approval is required before reservation. */
+  requireHumanApproval?: boolean;
 };
 
 export const AGENTPAY_POLICY_DOMAIN = {
@@ -216,6 +218,7 @@ export function policyTypedData(policy: ProcurementPolicy) {
       allowedPayToHash: hashes.allowedPayToHash,
       allowedModelsHash: hashes.allowedModelsHash,
       validUntil: BigInt(normalized.validUntil),
+      requireHumanApproval: Boolean(normalized.requireHumanApproval),
     },
   } as const;
 }
@@ -269,11 +272,11 @@ export function normalizePolicy(policy: ProcurementPolicy): ProcurementPolicy {
   const asset = canonicalAddress(policy.asset, 'asset');
   const policyId = String(policy.policyId || '').toLowerCase();
   if (!/^0x[0-9a-f]{64}$/.test(policyId)) throw new Error('policyId must be bytes32');
-  return { ...policy, policyId: policyId as `0x${string}`, owner, agentWallet, asset, maxTotalAtomic: maxTotal.toString(), maxPerRequestAtomic: maxPerRequest.toString(), allowedPayTo: [...new Set(policy.allowedPayTo.map((v) => canonicalAddress(v, 'allowedPayTo')))].sort(), allowedModels: [...new Set(policy.allowedModels.map(canonicalModel))].sort() };
+  return { ...policy, policyId: policyId as `0x${string}`, owner, agentWallet, asset, maxTotalAtomic: maxTotal.toString(), maxPerRequestAtomic: maxPerRequest.toString(), allowedPayTo: [...new Set(policy.allowedPayTo.map((v) => canonicalAddress(v, 'allowedPayTo')))].sort(), allowedModels: [...new Set(policy.allowedModels.map(canonicalModel))].sort(), requireHumanApproval: Boolean(policy.requireHumanApproval) };
 }
 
 export const AGENTPAY_EIP712 = {
-  policy: { Policy: [{ name: 'policyId', type: 'bytes32' }, { name: 'owner', type: 'address' }, { name: 'agentWallet', type: 'address' }, { name: 'chainId', type: 'uint256' }, { name: 'asset', type: 'address' }, { name: 'maxTotalAtomic', type: 'uint256' }, { name: 'maxPerRequestAtomic', type: 'uint256' }, { name: 'allowedPayToHash', type: 'bytes32' }, { name: 'allowedModelsHash', type: 'bytes32' }, { name: 'validUntil', type: 'uint64' }] },
+  policy: { Policy: [{ name: 'policyId', type: 'bytes32' }, { name: 'owner', type: 'address' }, { name: 'agentWallet', type: 'address' }, { name: 'chainId', type: 'uint256' }, { name: 'asset', type: 'address' }, { name: 'maxTotalAtomic', type: 'uint256' }, { name: 'maxPerRequestAtomic', type: 'uint256' }, { name: 'allowedPayToHash', type: 'bytes32' }, { name: 'allowedModelsHash', type: 'bytes32' }, { name: 'validUntil', type: 'uint64' }, { name: 'requireHumanApproval', type: 'bool' }] },
   reservation: { ReservationIntent: [{ name: 'policyId', type: 'bytes32' }, { name: 'purchaseId', type: 'bytes16' }, { name: 'requestDigest', type: 'bytes32' }, { name: 'commerceEnvelopeDigest', type: 'bytes32' }, { name: 'maxAtomic', type: 'uint256' }, { name: 'expiresAt', type: 'uint64' }] },
   revocation: { PolicyRevocation: [{ name: 'policyId', type: 'bytes32' }, { name: 'owner', type: 'address' }, { name: 'chainId', type: 'uint256' }, { name: 'revokedAt', type: 'uint64' }] },
 } as const;

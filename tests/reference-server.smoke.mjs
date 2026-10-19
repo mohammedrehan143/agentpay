@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { createApp } from '../apps/reference-server/src/index.js';
 import { agentPayDemoState } from '../apps/reference-server/src/agentpay.js';
+import { sha256Digest } from '../apps/reference-server/src/protocol_digests.js';
 
 process.env.AGENTPAY_RECORDED = '1';
 const app = createApp();
@@ -19,9 +20,10 @@ try {
   assert.ok(offer.validUntil > Math.floor(Date.now() / 1000));
   const purchaseId = '550e8400-e29b-41d4-a716-446655440099';
   const request = { prompt: 'Run the public AgentPay reference flow' };
+  const requestDigest = sha256Digest({ inputTokens: 1024, outputCap: 256, offerId: offer.offerId, body: request });
   const reservationResponse = await fetch(`${base}/api/agentpay/v1/policies/demo-policy/reservations`, {
     method: 'POST', headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ purchaseId, offerId: offer.offerId, request }),
+    body: JSON.stringify({ purchaseId, offerId: offer.offerId, request, inputTokens: 1024, outputCap: 256, requestDigest }),
   });
   assert.equal(reservationResponse.status, 200);
   const reservation = await reservationResponse.json();

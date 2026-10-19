@@ -71,6 +71,8 @@ export async function reconcileClaim(claim, { service = defaultService, chainRea
     const evidence = await chainReader(claim);
     if (evidence?.status === 'confirmed') return service.confirmChainSettlement(id, evidence);
     if (evidence?.status === 'consumed_without_tx') return service.markSettlementUnknown(id, evidence);
+    if (evidence?.status === 'disputed' || evidence?.status === 'rejected') return service.markSettlementDisputed(id, evidence);
+    if (evidence?.status === 'pending') return service.reschedule(id, { delayMs: 5000, reason: 'chain_confirmation_pending' });
   }
   if (claim.state === 'chain_confirmed' || claim.state === 'pending_receipt') {
     const payer = claim.authorization?.payer || claim.authorization?.from;
@@ -102,7 +104,7 @@ export function startAgentPayReconciliationJob({ dbProvider = () => connectedDb,
         const claim = await claimDuePurchase({ dbProvider, now: new Date() });
         if (!claim) break;
         try { await reconcileClaim(claim, { service, chainReader }); }
-        catch (error) { console.error('AgentPay reconciliation failed', claim.purchaseId, error); }
+        catch (error) { console.error('AgentPay reconciliation failed', claim.purchaseId, error); try { await service.reschedule(claim.purchaseId, { delayMs: 5000, reason: 'reconciliation_retry' }); } catch {} }
         finally {
           const database = dbProvider?.();
           if (database) await database.collection('agentpayPurchases').updateOne({ _id: claim._id, leaseToken: claim.leaseToken }, { $unset: { leaseToken: '', leaseExpiresAt: '' } });

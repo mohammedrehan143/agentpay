@@ -124,9 +124,12 @@ export async function agentPayReadiness(options = {}) {
   const offerReceipt = merchantSigningReadiness();
   const payTo = merchantPayToReadiness();
   const recorded = process.env.AGENTPAY_RECORDED !== '0';
+  const hasGemini = Boolean(String(process.env.GEMINI_API_KEY || process.env.GEMINI_APIKEY || '').trim());
+  const hasZhipu = Boolean(String(process.env.ZHIPU_APIKEY || '').trim());
+  const providerOk = hasGemini || hasZhipu;
   const provider = recorded
     ? { ok: true, mode: 'recorded-fixture', configured: false, reason: 'recorded mode uses the deterministic provider fixture' }
-    : { ok: Boolean(String(process.env.ZHIPU_APIKEY || '').trim()), mode: 'zhipu', configured: Boolean(String(process.env.ZHIPU_APIKEY || '').trim()), reason: String(process.env.ZHIPU_APIKEY || '').trim() ? 'ok' : 'ZHIPU_APIKEY is not configured' };
+    : { ok: providerOk, mode: hasGemini ? 'gemini' : 'zhipu', configured: providerOk, reason: providerOk ? 'ok' : 'Neither GEMINI_API_KEY nor ZHIPU_APIKEY is configured' };
   // The deterministic fixture key can sign demo artifacts, but must never
   // make a replay deployment appear ready to broadcast real payments.
   const liveSignerReady = !recorded && offerReceipt.configured && offerReceipt.ok;
@@ -288,7 +291,7 @@ const policyTypes = {
     { name: 'policyId', type: 'bytes32' }, { name: 'owner', type: 'address' }, { name: 'agentWallet', type: 'address' },
     { name: 'chainId', type: 'uint256' }, { name: 'asset', type: 'address' }, { name: 'maxTotalAtomic', type: 'uint256' },
     { name: 'maxPerRequestAtomic', type: 'uint256' }, { name: 'allowedPayToHash', type: 'bytes32' },
-    { name: 'allowedModelsHash', type: 'bytes32' }, { name: 'validUntil', type: 'uint64' },
+    { name: 'allowedModelsHash', type: 'bytes32' }, { name: 'validUntil', type: 'uint64' }, { name: 'requireHumanApproval', type: 'bool' },
   ],
 };
 const policyDomain = { name: 'AgentPay Procurement Policy', version: '1', chainId: 10143, salt: keccak256(stringToHex('toolkit.fun/agentpay/policy/v1')) };
@@ -303,7 +306,7 @@ export async function verifyProcurementPolicy({ policy, signature }) {
     const allowedModels = [...new Set((policy.allowedModels || []).map((value) => String(value).trim()))].sort();
     const allowedPayToHash = keccak256(encodeAbiParameters([{ type: 'address[]' }], [allowedPayTo]));
     const allowedModelsHash = keccak256(encodeAbiParameters([{ type: 'string[]' }], [allowedModels]));
-    return await verifyTypedData({ address: policy.owner, domain: policyDomain, types: policyTypes, primaryType: 'Policy', message: { policyId: policy.policyId, owner: policy.owner, agentWallet: policy.agentWallet, chainId: BigInt(policy.chainId), asset: policy.asset, maxTotalAtomic: BigInt(policy.maxTotalAtomic), maxPerRequestAtomic: BigInt(policy.maxPerRequestAtomic), allowedPayToHash, allowedModelsHash, validUntil: BigInt(policy.validUntil) }, signature });
+    return await verifyTypedData({ address: policy.owner, domain: policyDomain, types: policyTypes, primaryType: 'Policy', message: { policyId: policy.policyId, owner: policy.owner, agentWallet: policy.agentWallet, chainId: BigInt(policy.chainId), asset: policy.asset, maxTotalAtomic: BigInt(policy.maxTotalAtomic), maxPerRequestAtomic: BigInt(policy.maxPerRequestAtomic), allowedPayToHash, allowedModelsHash, validUntil: BigInt(policy.validUntil), requireHumanApproval: Boolean(policy.requireHumanApproval) }, signature });
   } catch { return false; }
 }
 

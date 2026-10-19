@@ -11,11 +11,12 @@
     "packages/*"
   ],
   "scripts": {
-    "dev": "tsx apps/reference-server/src/index.js",
-    "operator": "tsx apps/operator/server.mjs",
+    "dev": "node node_modules/tsx/dist/cli.mjs apps/reference-server/src/index.js",
+    "operator": "node node_modules/tsx/dist/cli.mjs apps/operator/server.mjs",
+    "build": "node scripts/build-vercel.mjs",
     "start": "node apps/reference-server/src/index.js",
     "typecheck": "tsc --noEmit",
-    "test": "npm run typecheck && vitest run && node tests/reference-server.smoke.mjs && node tests/demo.smoke.mjs",
+    "test": "npm run typecheck && vitest run && node tests/reference-server.smoke.mjs && node tests/demo.smoke.mjs && npm run check:private-imports",
     "check:private-imports": "node scripts/check-private-imports.mjs"
   },
   "dependencies": {
@@ -23,7 +24,7 @@
     "@x402/evm": "2.25.0",
     "@x402/extensions": "2.25.0",
     "@x402/fetch": "2.25.0",
-    "express": "5.1.0",
+    "express": "^5.1.0",
     "viem": "2.56.3"
   },
   "devDependencies": {

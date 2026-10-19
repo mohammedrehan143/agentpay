@@ -54,9 +54,12 @@ accepts or exports a wallet private key. Owner and agent use the same connected
 wallet in this attended testnet run, so it is not proof of unattended delegation.
 
 The operator independently matches the returned public proof to the new purchase
-and its Monad transfer. Generated code is tested only in a browser Web Worker
-served with a network-denying CSP and a two-second timeout, never in Node. Test
-results are local operator reports, not a signed model-quality attestation.
+and its Monad transfer. Generated code is tested by a server-owned disposable
+child process with Node permissions, a network-denying boundary, a two-second
+timeout and a bounded heap; it is never executed in the main backend process or
+workspace. The final report is produced by that harness rather than accepted
+from browser booleans. This is still a demo boundary, not a dedicated VM or a
+signed model-quality attestation.
 The operator retains private progress tokens in memory and excludes them from
 the downloadable public evidence. Keep the process alive during reconciliation.
 

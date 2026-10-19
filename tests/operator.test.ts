@@ -126,6 +126,8 @@ describe('local wallet operator safety boundary', () => {
       const config=await (await fetch(`${base}/api/session`)).json();
       const post=(route:string,body:unknown)=>fetch(`${base}/api/${route}`,{method:'POST',headers:{origin:base,'content-type':'application/json','x-operator-token':config.token},body:JSON.stringify(body)});
       const state=async()=> (await fetch(`${base}/api/state`)).json();
+      const baseline = await (await post('baseline', {})).json();
+      expect(baseline.passed).toBe(false);
       const started=await (await post('start',{wallet:NETWORK.payTo,consent:true,baselinePassed:false})).json();
       let first:any;
       await expect.poll(async()=>{first=await state();return first.pending?.typedData?.primaryType;},{interval:10}).toBe('Policy');

@@ -1,5 +1,6 @@
 // Served with a separate CSP denying network, nested workers and script imports.
 self.onmessage = ({ data }) => {
+  const reportToken = String(data.token || '');
   try {
     let source = String(data.source || '').trim();
     if (source.startsWith('```')) source = source.replace(/^```(?:javascript|js)?\s*\n/, '').replace(/\n```\s*$/, '').trim();
@@ -8,6 +9,6 @@ self.onmessage = ({ data }) => {
     const first = createCheckout(); const a = first.pay('a');
     const different = createCheckout(); different.pay('a'); different.pay('b');
     const retry = createCheckout(); const original = retry.pay('a'); const repeated = retry.pay('a');
-    self.postMessage({ tests: [{ name: 'First request', pass: a.id === 'receipt-1' && first.charges === 1 }, { name: 'Distinct keys', pass: different.charges === 2 }, { name: 'Retry reuses receipt', pass: original === repeated && retry.charges === 1 }] });
-  } catch { self.postMessage({ error: 'Generated source did not satisfy the checkout interface. No code was replaced.' }); }
+    self.postMessage({ token: reportToken, tests: [{ name: 'First request', pass: a.id === 'receipt-1' && first.charges === 1 }, { name: 'Distinct keys', pass: different.charges === 2 }, { name: 'Retry reuses receipt', pass: original === repeated && retry.charges === 1 }] });
+  } catch { self.postMessage({ token: reportToken, error: 'Generated source did not satisfy the checkout interface. No code was replaced.' }); }
 };

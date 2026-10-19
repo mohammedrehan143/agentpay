@@ -25,7 +25,7 @@ function policyFingerprint(policy = {}) {
     chainId: Number(policy.chainId || 0), asset: String(policy.asset || '').toLowerCase(),
     maxTotalAtomic: String(policy.maxTotalAtomic || '0'), maxPerRequestAtomic: String(policy.maxPerRequestAtomic || '0'),
     allowedPayTo: [...(policy.allowedPayTo || [])].map((value) => String(value).toLowerCase()).sort(),
-    allowedModels: [...(policy.allowedModels || [])].map(String).sort(), validUntil: Number(policy.validUntil || 0),
+    allowedModels: [...(policy.allowedModels || [])].map(String).sort(), validUntil: Number(policy.validUntil || 0), requireHumanApproval: Boolean(policy.requireHumanApproval),
   });
 }
 
@@ -52,6 +52,16 @@ export class AgentPayPurchaseService {
     if (!purchaseId) throw conflict('reservation_conflict', 'purchaseId is required');
     const policyId = String(input.policyId || '');
     const policy = input.policy || { policyId, maxTotalAtomic: input.maximumAtomic || '0', maxPerRequestAtomic: input.maximumAtomic || '0' };
+    const maximumAtomic = BigInt(input.maximumAtomic || input.offer?.x402MaxAtomic || '0');
+    if (policy.validUntil !== undefined && Number(policy.validUntil) <= Math.floor(this.clock() / 1000)) {
+      throw Object.assign(new Error('policy has expired'), { status: 403, code: 'policy_expired' });
+    }
+    if (policy.maxPerRequestAtomic !== undefined && maximumAtomic > BigInt(policy.maxPerRequestAtomic)) {
+      throw Object.assign(new Error('purchase exceeds the policy per-inference authorization limit'), { status: 403, code: 'price_exceeds_policy' });
+    }
+    if (policy.requireHumanApproval === true && input.humanApproval !== true) {
+      throw Object.assign(new Error('owner policy requires human approval'), { status: 403, code: 'policy_invalid' });
+    }
     if (!this.useMongo && this.policies.get(policyId)?.revokedAt) throw Object.assign(new Error('policy revoked'), { status: 403, code: 'policy_revoked' });
     if (!this.useMongo) {
       const existing = this.memory.get(purchaseId);
@@ -65,7 +75,7 @@ export class AgentPayPurchaseService {
       const maxTotal = BigInt(projection.maxTotalAtomic || input.maximumAtomic || '0');
       const committed = [...this.memory.values()].filter((item) => item.policyId === policyId && item.state === 'matched').reduce((sum, item) => sum + BigInt(item.actualAtomic || '0'), 0n);
       const active = [...this.memory.values()].filter((item) => item.policyId === policyId && !TERMINAL.has(item.state)).reduce((sum, item) => sum + BigInt(item.maximumAtomic || '0'), 0n);
-      if (committed + active + BigInt(input.maximumAtomic || '0') > maxTotal) throw conflict('reservation_conflict', 'policy total budget is exhausted');
+      if (committed + active + maximumAtomic > maxTotal) throw conflict('reservation_conflict', 'policy total budget is exhausted');
       this.policies.set(policyId, projection);
       const reservationExpiresAt = new Date(this.clock() + 300000);
       const record = {
@@ -78,7 +88,7 @@ export class AgentPayPurchaseService {
         requestDigest,
         inputTokens: input.inputTokens,
         outputCap: input.outputCap,
-        maximumAtomic: String(input.maximumAtomic || input.offer?.x402MaxAtomic || '0'),
+        maximumAtomic: maximumAtomic.toString(),
         progressTokenHash: String(input.progressTokenHash || ''),
         progressTokenExpiresAt: new Date(this.clock() + 300000),
         accessNonce: String(input.accessNonce || crypto.randomBytes(16).toString('hex')),
@@ -97,6 +107,7 @@ export class AgentPayPurchaseService {
       };
       this.appendEvent(record, 'reserved', 'Policy ceiling reserved', { maximumAtomic: record.maximumAtomic });
       this.memory.set(purchaseId, record);
+      record.budget = this.budgetSnapshot(policyId);
       return this.clone(record);
     }
     return withDbTransaction(async (session) => {
@@ -111,10 +122,14 @@ export class AgentPayPurchaseService {
       await policyCol.updateOne({ policyId }, { $setOnInsert: { policyId, ...policy, policyFingerprint: fingerprint, createdAt: new Date(this.clock()) }, $set: { updatedAt: new Date(this.clock()) } }, { upsert: true, session });
       const projection = await policyCol.findOne({ policyId }, { session });
       if (String(projection?.policyFingerprint || policyFingerprint(projection)) !== fingerprint) throw conflict('policy_invalid', 'policyId already binds a different owner or policy envelope');
+      if (projection?.revokedAt) throw Object.assign(new Error('policy revoked'), { status: 403, code: 'policy_revoked' });
+      if (projection?.validUntil !== undefined && Number(projection.validUntil) <= Math.floor(this.clock() / 1000)) throw Object.assign(new Error('policy has expired'), { status: 403, code: 'policy_expired' });
+      if (projection?.maxPerRequestAtomic !== undefined && maximumAtomic > BigInt(projection.maxPerRequestAtomic)) throw Object.assign(new Error('purchase exceeds the policy per-inference authorization limit'), { status: 403, code: 'price_exceeds_policy' });
+      if (projection?.requireHumanApproval === true && input.humanApproval !== true) throw Object.assign(new Error('owner policy requires human approval'), { status: 403, code: 'policy_invalid' });
       const maxTotal = BigInt(projection?.maxTotalAtomic || input.maximumAtomic || '0');
       const totals = await col.aggregate([{ $match: { policyId } }, { $group: { _id: null, committed: { $sum: { $cond: [{ $eq: ['$state', 'matched'] }, { $toLong: { $ifNull: ['$actualAtomic', '0'] } }, 0] } }, active: { $sum: { $cond: [{ $not: [{ $in: ['$state', [...TERMINAL]] }] }, { $toLong: { $ifNull: ['$maximumAtomic', '0'] } }, 0] } } } }], { session }).toArray();
       const total = totals[0] || { committed: 0, active: 0 };
-      if (BigInt(total.committed || 0) + BigInt(total.active || 0) + BigInt(input.maximumAtomic || '0') > maxTotal) throw conflict('reservation_conflict', 'policy total budget is exhausted');
+      if (BigInt(total.committed || 0) + BigInt(total.active || 0) + maximumAtomic > maxTotal) throw conflict('reservation_conflict', 'policy total budget is exhausted');
       const reservationExpiresAt = new Date(this.clock() + 300000);
       const record = {
         purchaseId,
@@ -125,7 +140,7 @@ export class AgentPayPurchaseService {
         requestDigest,
         inputTokens: input.inputTokens,
         outputCap: input.outputCap,
-        maximumAtomic: String(input.maximumAtomic || input.offer?.x402MaxAtomic || '0'),
+        maximumAtomic: maximumAtomic.toString(),
         state: 'reserved', reconciliation: 'reserved', terminal: false,
         createdAt: new Date(this.clock()), updatedAt: new Date(this.clock()), events: [],
         progressTokenHash: String(input.progressTokenHash || ''),
@@ -169,6 +184,46 @@ export class AgentPayPurchaseService {
       if (result.modifiedCount !== 1) throw conflict('authorization_conflict', 'purchase changed concurrently');
       return col.findOne({ _id: record._id }, { session });
     }, { allowStandaloneFallback: true });
+  }
+
+  budgetSnapshot(policyId) {
+    const policy = this.policies.get(String(policyId));
+    const maxTotal = BigInt(policy?.maxTotalAtomic || '0');
+    const committed = [...this.memory.values()]
+      .filter((item) => item.policyId === String(policyId) && item.state === 'matched')
+      .reduce((sum, item) => sum + BigInt(item.actualAtomic || '0'), 0n);
+    const reserved = [...this.memory.values()]
+      .filter((item) => item.policyId === String(policyId) && !TERMINAL.has(item.state))
+      .reduce((sum, item) => sum + BigInt(item.maximumAtomic || '0'), 0n);
+    return { maxTotalAtomic: maxTotal.toString(), committedAtomic: committed.toString(), reservedAtomic: reserved.toString(), remainingAtomic: (maxTotal - committed - reserved < 0n ? 0n : maxTotal - committed - reserved).toString() };
+  }
+
+  async getBudget(policyId) {
+    const id = String(policyId || '');
+    if (!this.useMongo) return this.budgetSnapshot(id);
+    const policy = await this.dbProvider().collection('agentpayPolicies').findOne({ policyId: id });
+    const totals = await this.collection().aggregate([
+      { $match: { policyId: id } },
+      { $group: { _id: null, committed: { $sum: { $cond: [{ $eq: ['$state', 'matched'] }, { $toLong: { $ifNull: ['$actualAtomic', '0'] } }, 0] } }, reserved: { $sum: { $cond: [{ $not: [{ $in: ['$state', [...TERMINAL]] }] }, { $toLong: { $ifNull: ['$maximumAtomic', '0'] } }, 0] } } } },
+    ]).toArray();
+    const maxTotal = BigInt(policy?.maxTotalAtomic || '0');
+    const committed = BigInt(totals[0]?.committed || 0);
+    const reserved = BigInt(totals[0]?.reserved || 0);
+    return { maxTotalAtomic: maxTotal.toString(), committedAtomic: committed.toString(), reservedAtomic: reserved.toString(), remainingAtomic: (maxTotal - committed - reserved < 0n ? 0n : maxTotal - committed - reserved).toString() };
+  }
+
+  async reschedule(purchaseId, { delayMs = 5000, reason = 'awaiting reconciliation' } = {}) {
+    const next = new Date(this.clock() + Math.max(250, Number(delayMs) || 5000));
+    if (!this.useMongo) {
+      const record = this.memory.get(String(purchaseId));
+      if (!record) throw Object.assign(new Error('purchase not found'), { status: 404, code: 'purchase_not_found' });
+      record.nextReconcileAt = next;
+      record.reconciliation = reason;
+      record.updatedAt = new Date(this.clock());
+      return this.clone(record);
+    }
+    await this.collection().updateOne({ purchaseId: String(purchaseId) }, { $set: { nextReconcileAt: next, reconciliation: reason, updatedAt: new Date(this.clock()) } });
+    return this.get(purchaseId);
   }
 
   async revokePolicy(policyId, revocation = {}) {
@@ -250,7 +305,7 @@ export class AgentPayPurchaseService {
       if (String(existing.actualAtomic || '') !== String(chain.actualAtomic || '') || (existing.txHash && chain.txHash && existing.txHash !== chain.txHash)) throw conflict('disputed_amount', 'chain evidence conflicts with stored settlement');
       return existing;
     }
-    if (existing && chain.actualAtomic !== undefined && BigInt(chain.actualAtomic) > BigInt(existing.maximumAtomic || '0')) throw conflict('disputed_amount', 'chain amount exceeds reserved ceiling');
+    if (existing && chain.actualAtomic !== undefined && (BigInt(chain.actualAtomic) < 0n || BigInt(chain.actualAtomic) > BigInt(existing.maximumAtomic || '0'))) throw conflict('disputed_amount', 'chain amount is outside the reserved ceiling');
     return this.transition(purchaseId, 'chain_confirmed', 'Monad receipt independently matched', chain, { chainEvidence: chain, actualAtomic: String(chain.actualAtomic), txHash: chain.txHash || existing?.txHash || null, reconciliation: 'pending_receipt' });
   }
   async recordDeliveryReceipt(purchaseId, receipt) {

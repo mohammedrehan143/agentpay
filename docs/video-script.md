@@ -2,11 +2,10 @@
 
 ## Current release: real paid repair
 
-The first video on the [public brief](https://x2v-co.github.io/agentpay/brief.html)
+The first video on the [public brief](../apps/demo/brief.html)
 reviews the completed September 10 purchase: OpenRouter generated the unchanged
 repair, all three isolated browser tests passed, and 220 tokens settled for
-0.000033 test USDC. The 54.2-second recording has English captions and is pinned
-with the evidence in [v0.2.0](https://github.com/x2v-co/agentpay/releases/tag/v0.2.0).
+0.000033 test USDC. The 54.2-second recording has English captions.
 It is a retrospective evidence walkthrough, not original wallet-signing footage.
 Tests are owner-reported, not cryptographic execution attestations.
 

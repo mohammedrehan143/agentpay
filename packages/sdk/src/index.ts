@@ -75,7 +75,7 @@ export async function createX402PaymentSigner(input: { signer: unknown; rpcUrl?:
   };
 }
 
-export function joinDiscovery(models: AiplansRecord[], offers: ToolkitMachineOffer[], options: { policy?: ProcurementPolicy } = {}): DiscoveryChoice {
+export function joinDiscovery(models: AiplansRecord[], offers: ToolkitMachineOffer[], options: { policy?: ProcurementPolicy; inputTokens?: number; outputCap?: number } = {}): DiscoveryChoice {
   const rejected: DiscoveryChoice['rejected'] = [];
   const eligible: ToolkitMachineOffer[] = [];
   const seen = new Map<string, ToolkitMachineOffer>();
@@ -83,6 +83,9 @@ export function joinDiscovery(models: AiplansRecord[], offers: ToolkitMachineOff
     const key = canonicalDiscoveryKey(offer.providerSlug, offer.modelSlug);
     if (offer.validUntil <= Math.floor(Date.now() / 1000)) { rejected.push({ offerId: offer.offerId, code: 'offer_expired', detail: 'offer validity has elapsed' }); continue; }
     if (offer.fulfillment !== 'machine') { rejected.push({ offerId: offer.offerId, code: 'human_checkout', detail: 'route is not machine fulfillable' }); continue; }
+    if (options.inputTokens !== undefined && options.outputCap !== undefined && (options.inputTokens > offer.maxInputTokens || options.outputCap > offer.maxOutputTokens)) {
+      rejected.push({ offerId: offer.offerId, code: 'offer_invalid', detail: 'offer token caps are below the requested bounds' }); continue;
+    }
     const modelRows = models.filter((m) => canonicalDiscoveryKey(m.providerSlug, m.modelSlug) === key);
     if (!modelRows.length) { rejected.push({ offerId: offer.offerId, code: 'unmapped_model', detail: 'aiplans mapping is not unique' }); continue; }
     // Prefer USD rows. A regional producer may only publish a CNY catalog row
@@ -102,7 +105,14 @@ export function joinDiscovery(models: AiplansRecord[], offers: ToolkitMachineOff
     if (seen.has(key)) { rejected.push({ offerId: offer.offerId, code: 'ambiguous_mapping', detail: 'multiple Toolkit offers map to one model' }); continue; }
     seen.set(key, offer); eligible.push(offer);
   }
-  eligible.sort((a, b) => BigInt(a.x402MaxAtomic) < BigInt(b.x402MaxAtomic) ? -1 : BigInt(a.x402MaxAtomic) > BigInt(b.x402MaxAtomic) ? 1 : a.modelSlug.localeCompare(b.modelSlug));
+  eligible.sort((a, b) => {
+    if (options.inputTokens !== undefined && options.outputCap !== undefined) {
+      const aCost = calculateChargeAtomic(options.inputTokens, options.outputCap, a.inputAtomicPerMillion, a.outputAtomicPerMillion);
+      const bCost = calculateChargeAtomic(options.inputTokens, options.outputCap, b.inputAtomicPerMillion, b.outputAtomicPerMillion);
+      if (aCost !== bCost) return aCost < bCost ? -1 : 1;
+    }
+    return BigInt(a.x402MaxAtomic) < BigInt(b.x402MaxAtomic) ? -1 : BigInt(a.x402MaxAtomic) > BigInt(b.x402MaxAtomic) ? 1 : a.modelSlug.localeCompare(b.modelSlug);
+  });
   return { recommended: eligible[0], candidates: eligible, rejected };
 }
 
@@ -110,9 +120,9 @@ export function createAgentPay(options: { policy: ProcurementPolicy; policySigna
   const policy = normalizePolicy(options.policy);
   const fetcher = options.fetch || fetch;
   const baseUrl = String(options.baseUrl || '').replace(/\/$/, '');
-  async function discover(): Promise<DiscoveryChoice> {
+  async function discover(bounds: { inputTokens?: number; outputCap?: number } = {}): Promise<DiscoveryChoice> {
     const [models, offers] = await Promise.all([options.discovery.listModels(), options.discovery.listOffers()]);
-    const choice = joinDiscovery(models, offers, { policy });
+    const choice = joinDiscovery(models, offers, { policy, ...bounds });
     if (!choice.recommended) throw new AgentPayProblemError(problem({ status: 422, code: 'no_eligible_offer', phase: 'discovery', retryable: true, nextAction: 'requote', title: 'No eligible machine offer', detail: 'Discovery returned no policy-eligible route' }));
     return choice;
   }
@@ -121,20 +131,23 @@ export function createAgentPay(options: { policy: ProcurementPolicy; policySigna
     if (policy.validUntil <= now) throw new AgentPayProblemError(problem({ status: 403, code: 'policy_expired', phase: 'preflight', retryable: false, nextAction: 'stop', title: 'Procurement policy has expired' }));
     if (offer.validUntil <= now) throw new AgentPayProblemError(problem({ status: 422, code: 'offer_expired', phase: 'preflight', retryable: true, nextAction: 'requote', title: 'Offer has expired' }));
     if (!Number.isInteger(inputTokens) || inputTokens < 0 || !Number.isInteger(outputCap) || outputCap < 0) throw new AgentPayProblemError(problem({ status: 422, code: 'offer_invalid', phase: 'preflight', retryable: false, nextAction: 'stop', title: 'Token bounds are invalid' }));
+    if (inputTokens > offer.maxInputTokens || outputCap > offer.maxOutputTokens) throw new AgentPayProblemError(problem({ status: 422, code: 'offer_invalid', phase: 'preflight', retryable: false, nextAction: 'stop', title: 'Requested token bounds exceed the offer caps' }));
+    if (offer.network && offer.network !== `eip155:${policy.chainId}`) throw new AgentPayProblemError(problem({ status: 403, code: 'policy_invalid', phase: 'preflight', retryable: false, nextAction: 'stop', title: 'Offer is on a network outside policy' }));
+    if (offer.asset && offer.asset.toLowerCase() !== policy.asset.toLowerCase()) throw new AgentPayProblemError(problem({ status: 403, code: 'policy_invalid', phase: 'preflight', retryable: false, nextAction: 'stop', title: 'Offer uses an asset outside policy' }));
     if (!policyAllowsModel(policy, canonicalDiscoveryKey(offer.providerSlug, offer.modelSlug))) throw new AgentPayProblemError(problem({ status: 403, code: 'policy_invalid', phase: 'preflight', retryable: false, nextAction: 'stop', title: 'Model is outside policy' }));
     if (!policy.allowedPayTo.map((v) => v.toLowerCase()).includes(offer.payTo.toLowerCase())) throw new AgentPayProblemError(problem({ status: 403, code: 'policy_invalid', phase: 'preflight', retryable: false, nextAction: 'stop', title: 'Merchant is outside policy' }));
     const worstCase = calculateChargeAtomic(inputTokens, outputCap, offer.inputAtomicPerMillion, offer.outputAtomicPerMillion);
-    if (worstCase > BigInt(policy.maxPerRequestAtomic) || worstCase > BigInt(offer.x402MaxAtomic)) throw new AgentPayProblemError(problem({ status: 422, code: 'price_exceeds_policy', phase: 'preflight', retryable: true, nextAction: 'requote', title: 'Offer exceeds delegated budget' }));
+    if (worstCase > BigInt(policy.maxPerRequestAtomic) || worstCase > BigInt(offer.x402MaxAtomic) || BigInt(offer.x402MaxAtomic) > BigInt(policy.maxPerRequestAtomic)) throw new AgentPayProblemError(problem({ status: 422, code: 'price_exceeds_policy', phase: 'preflight', retryable: true, nextAction: 'requote', title: 'Offer exceeds delegated budget' }));
     return { worstCaseAtomic: worstCase.toString(), requestDigest: digest({ inputTokens, outputCap, offerId: offer.offerId, body }) };
   }
   async function invoke(offer: ToolkitMachineOffer, body: Record<string, unknown>, purchaseId: string = crypto.randomUUID()) {
     const response = await fetcher(`${baseUrl}${offer.route}`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-agentpay-purchase-id': purchaseId }, body: JSON.stringify(body) });
-    if (!response.ok && response.status !== 402) {
+    if (response.status !== 402) {
       let payload: unknown; try { payload = await response.json(); } catch { payload = null; }
       if (payload && typeof payload === 'object' && 'code' in payload) {
         try { throw new AgentPayProblemError(problem(payload as AgentPayProblem)); } catch (error) { if (error instanceof AgentPayProblemError) throw error; }
       }
-      throw new AgentPayProblemError(problem({ status: response.status, code: 'transport_before_dispatch', phase: 'execution', retryable: true, nextAction: 'retry_same_purchase', title: 'AgentPay request failed' }));
+      throw new AgentPayProblemError(problem({ status: response.status || 502, code: 'authorization_conflict', phase: 'authorization', retryable: false, nextAction: 'stop', title: 'Merchant did not issue an x402 payment quote' }));
     }
     return response;
   }
@@ -164,8 +177,8 @@ export function createAgentPay(options: { policy: ProcurementPolicy; policySigna
     } while (Date.now() <= deadline);
     return { status: 'pending' as const, purchaseId: input.purchaseId, reconciliation: latest };
   }
-  async function buy(input: { body: Record<string, unknown>; inputTokens: number; outputCap: number; policyId: string; offer?: ToolkitMachineOffer; purchaseId?: string; signReservation?: (intent: Record<string, unknown>) => Promise<string> | string; signPayment?: (quote: unknown) => Promise<string> | string; waitForSettlement?: boolean; settlementTimeoutMs?: number; pollIntervalMs?: number }) {
-    const choice = await discover();
+  async function buy(input: { body: Record<string, unknown>; inputTokens: number; outputCap: number; policyId: string; offer?: ToolkitMachineOffer; purchaseId?: string; signReservation?: (intent: Record<string, unknown>) => Promise<string> | string; signPayment?: (quote: unknown) => Promise<string> | string; waitForSettlement?: boolean; settlementTimeoutMs?: number; pollIntervalMs?: number; humanApproval?: boolean }) {
+    const choice = await discover({ inputTokens: input.inputTokens, outputCap: input.outputCap });
     const selected = input.offer || choice.recommended;
     if (!selected) throw new AgentPayProblemError(problem({ status: 422, code: 'no_eligible_offer', phase: 'discovery', retryable: true, nextAction: 'requote', title: 'No eligible machine offer' }));
     if (input.offer && !choice.candidates.some((candidate) => candidate.offerId === input.offer?.offerId)) {
@@ -192,7 +205,7 @@ export function createAgentPay(options: { policy: ProcurementPolicy; policySigna
     }
     const reservationResponse = await fetcher(`${baseUrl}/api/agentpay/v1/policies/${encodeURIComponent(input.policyId)}/reservations`, {
       method: 'POST', headers: { 'content-type': 'application/json', 'x-agentpay-request-digest': check.requestDigest },
-      body: JSON.stringify({ purchaseId, offerId: selected.offerId, request: input.body, inputTokens: input.inputTokens, outputCap: input.outputCap, requestDigest: check.requestDigest, policy, ...(options.policySignature ? { policySignature: options.policySignature } : {}), ...(reservationIntent ? { intent: reservationIntent, signature: reservationSignature } : {}) }),
+      body: JSON.stringify({ purchaseId, offerId: selected.offerId, request: input.body, inputTokens: input.inputTokens, outputCap: input.outputCap, requestDigest: check.requestDigest, policy, ...(input.humanApproval !== undefined ? { humanApproval: input.humanApproval } : {}), ...(options.policySignature ? { policySignature: options.policySignature } : {}), ...(reservationIntent ? { intent: reservationIntent, signature: reservationSignature } : {}) }),
     });
     if (!reservationResponse.ok) throw new AgentPayProblemError(problem({ status: reservationResponse.status, code: 'reservation_temporarily_unavailable', phase: 'reservation', retryable: true, nextAction: 'retry_same_purchase', title: 'Reservation failed', purchaseId }));
     const reservation = await reservationResponse.json();
@@ -212,7 +225,12 @@ export function createAgentPay(options: { policy: ProcurementPolicy; policySigna
       return { status: 'pending' as const, purchaseId, offer: selected, reservation, response: paidResponse, quote, pending };
     }
     if (!paidResponse.ok) { let payload: unknown; try { payload = await paidResponse.json(); } catch { payload = null; } if (payload && typeof payload === 'object' && 'code' in payload) throw new AgentPayProblemError(problem(payload as AgentPayProblem)); throw new AgentPayProblemError(problem({ status: paidResponse.status, code: 'settlement_unknown', phase: 'settlement', retryable: true, nextAction: 'continue_reconciliation', title: 'Payment did not reach final state', purchaseId })); }
-    return { status: 'matched' as const, purchaseId, offer: selected, reservation, response: paidResponse, quote };
+    let matched: any;
+    try { matched = await paidResponse.clone().json(); } catch { matched = null; }
+    if (!matched || matched.purchaseId !== purchaseId || matched.receipt?.status !== 'paid' || typeof matched.receipt?.actualAtomic !== 'string' || typeof matched.receipt?.proofId !== 'string' || !matched.receipt.proofId) {
+      throw new AgentPayProblemError(problem({ status: 502, code: 'settlement_unknown', phase: 'receipt', retryable: true, nextAction: 'continue_reconciliation', title: 'Merchant response lacks verified settlement evidence', purchaseId }));
+    }
+    return { status: 'matched' as const, purchaseId, offer: selected, reservation, response: paidResponse, quote, result: matched };
   }
   async function recoverAccess(input: { url: string; signer: AgentPayRecoverySigner; init?: RequestInit }) {
     const challengeResponse = await fetcher(input.url, input.init);

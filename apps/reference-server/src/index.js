@@ -25,4 +25,4 @@ export function startServer({ port = Number(process.env.PORT || 4021) } = {}) {
   return { server, reconciliation };
 }
 
-if (process.argv[1] === fileURLToPath(import.meta.url)) startServer();
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) startServer();

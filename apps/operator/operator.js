@@ -22,11 +22,12 @@ function renderTests(id, tests) { const root = byId(id); root.replaceChildren();
 function isolatedTests(source) {
   return new Promise((resolve, reject) => {
     const worker = new Worker('./evaluate-worker.js');
+    const token = crypto.randomUUID();
     const timer = setTimeout(() => { worker.terminate(); reject(new Error('Generated code exceeded the 2-second test limit')); }, 2000);
     const finish = () => { clearTimeout(timer); worker.terminate(); };
-    worker.onmessage = event => { finish(); if (event.data.error) reject(new Error(event.data.error)); else if (Array.isArray(event.data.tests) && event.data.tests.length === 3) resolve(event.data.tests); else reject(new Error('Invalid test report')); };
+    worker.onmessage = event => { if (event.data.token !== token) return; finish(); if (event.data.error) reject(new Error(event.data.error)); else if (Array.isArray(event.data.tests) && event.data.tests.length === 3) resolve(event.data.tests); else reject(new Error('Invalid test report')); };
     worker.onerror = () => { finish(); reject(new Error('Isolated worker failed')); };
-    worker.postMessage({ source });
+    worker.postMessage({ source, token });
   });
 }
 async function assertWallet() {
@@ -49,6 +50,7 @@ async function status() {
     : current.pending ? `Confirm ${current.pending.typedData?.primaryType || 'recovery'} in MetaMask. Request expires in ${Math.max(0, Math.ceil((current.pending.expiresAt - Date.now()) / 1000))} seconds. If no popup appears, click Confirm in wallet.`
       : current.status === 'running' ? 'Preparing your wallet request…' : '';
   byId('events').textContent = current.events.map(e => `${e.at} ${e.message}`).join('\n');
+  byId('execution-details').textContent = current.execution ? JSON.stringify(current.execution, null, 2) : 'No live execution record yet.';
   byId('signing').hidden = !current.pending;
   if (current.pending) { byId('signature-title').textContent = current.pending.typedData?.primaryType || 'Recovery message'; byId('typed-data').textContent = current.pending.typedData ? JSON.stringify(current.pending.typedData, null, 2) : current.pending.message; }
   if (current.pending && current.pending.id !== lastPendingId) { lastPendingId = current.pending.id; byId('signing').scrollIntoView({ block: 'center', behavior: 'smooth' }); }
@@ -58,7 +60,7 @@ async function status() {
   byId('sign').disabled = busy;
   byId('recover').disabled = busy || !['recovery-required','recovery-blocked'].includes(current.status);
   byId('test-output').disabled = busy || !current.evidence;
-  byId('download').disabled = !current.evidence;
+  byId('download').disabled = !current.evidence?.report;
   if (current.evidence) {
     byId('output').textContent = current.evidence.rawOutput;
     if (current.evidence.tests) renderTests('output-tests', current.evidence.tests);
@@ -83,7 +85,7 @@ action('approve', async () => {
   byId('wallet-status').textContent = `Approval submitted: ${hash}. Check readiness again after confirmation.`;
   funding = null;
 });
-action('baseline-run', async () => { const tests = await isolatedTests(config.baseline); renderTests('baseline-tests', tests); baselineFailed = tests[0].pass && tests[1].pass && !tests[2].pass; });
+action('baseline-run', async () => { const result = await request('baseline', {}); renderTests('baseline-tests', result.tests); baselineFailed = result.passed === false && result.tests[0].pass && result.tests[1].pass && !result.tests[2].pass; });
 async function signCurrentRequest() {
   await assertWallet();
   const pending = current.pending; if (!pending) return;
@@ -111,11 +113,11 @@ action('reconcile', async () => { await request('reconcile', {}); });
 action('retry-signature', async () => { await assertWallet(); await request('retry-signature', { wallet }); await openPreparedSignature(); });
 action('recover', async () => { await assertWallet(); await request('recover', { wallet }); });
 action('test-output', async () => {
-  let tests;
-  try { tests = await isolatedTests(current.evidence.rawOutput); }
-  catch (error) { tests = ['First request', 'Distinct keys', 'Retry reuses receipt'].map(name => ({ name, pass: false })); byId('wallet-status').textContent = error.message; }
-  renderTests('output-tests', tests); await request('tests', { tests });
+  try {
+    const result = await request('tests', { source: current.evidence.rawOutput });
+    renderTests('output-tests', result.tests);
+  } catch (error) { byId('wallet-status').textContent = error.message; throw error; }
 });
-action('download', async () => { const url = URL.createObjectURL(new Blob([JSON.stringify(current.evidence, null, 2)], { type: 'application/json' })); const a = document.createElement('a'); a.href = url; a.download = `agentpay-${current.evidence.purchaseId}.json`; a.click(); setTimeout(() => URL.revokeObjectURL(url), 1000); });
+action('download', async () => { const response = await fetch('/api/report'); if (!response.ok) throw new Error('Final evidence report is not ready'); const report = await response.text(); const url = URL.createObjectURL(new Blob([report], { type: 'text/markdown' })); const a = document.createElement('a'); a.href = url; a.download = `agentpay-${current.evidence.purchaseId}.md`; a.click(); setTimeout(() => URL.revokeObjectURL(url), 1000); });
 byId('consent').onchange = buttons;
 (async () => { config = await request('session'); byId('selected-provider').textContent = `Selected route: ${config.selectedProvider.provider} / ${config.selectedProvider.model}. No automatic provider fallback.`; byId('baseline').textContent = config.baseline; await status(); const poll = async () => { try { if (!busy) await status(); } catch { byId('run-status').textContent = 'Local server disconnected. Do not create another purchase.'; } setTimeout(poll, 1200); }; setTimeout(poll, 1200); })().catch(error => { byId('run-status').textContent = error.message; });

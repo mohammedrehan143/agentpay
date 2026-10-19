@@ -32,6 +32,11 @@ let aiplansCache = null;
 
 function now() { return new Date().toISOString(); }
 function hash(value) { return `sha256:${crypto.createHash('sha256').update(JSON.stringify(value)).digest('hex')}`; }
+function textHash(value) { return `sha256:${crypto.createHash('sha256').update(String(value)).digest('hex')}`; }
+function calculateChargeAtomic(inputTokens, outputTokens, inputRate, outputRate) {
+  const numerator = BigInt(inputTokens) * BigInt(inputRate) + BigInt(outputTokens) * BigInt(outputRate);
+  return (numerator + 999999n) / 1000000n;
+}
 function purchaseBytes16(value) {
   const hex = String(value || '').replaceAll('-', '').toLowerCase();
   return /^([0-9a-f]{32})$/.test(hex) ? `0x${hex}` : null;
@@ -43,10 +48,20 @@ function digestBytes32(value) {
 }
 function safePurchase(p) {
   if (!p) return null;
+  const model = p.offer ? `${p.offer.providerSlug}/${p.offer.modelSlug}` : null;
+  const paymentStatus = p.state === 'matched' ? 'verified_settlement' : p.state === 'facilitator_settled' || p.state === 'chain_confirmed' ? 'submitted_pending_verification' : p.authorization ? 'authorized_not_settled' : 'not_submitted';
+  const execution = {
+    schema: 'agentpay.execution.v1', taskId: p.purchaseId, policyId: p.policyId, selectedModel: model,
+    provider: p.offer?.providerSlug || null, quotedPrice: { authorizedMaximum: p.maximumAtomic || null, currency: 'atomic USDC' },
+    usage: p.usage ? { ...publicUsage(p), actualAtomic: p.actualAtomic || null } : null,
+    payment: { status: paymentStatus, transactionReference: p.txHash || null, verification: p.chainEvidence || null },
+    modelResponseDigest: typeof p.result?.output === 'string' ? textHash(p.result.output) : null, generatedPatch: p.result?.output || null,
+    acceptance: p.acceptance || null, outcome: p.state === 'matched' ? 'accepted_for_delivery' : p.state,
+  };
   return {
     purchaseId: p.purchaseId, policyId: p.policyId, state: p.state, reconciliation: p.reconciliation,
-    offer: p.offer, events: p.events || [], actualAtomic: p.actualAtomic || null,
-    txHash: p.txHash || null, receipt: p.receipt || null, result: p.result || null,
+    offer: p.offer, events: p.events || [], actualAtomic: p.actualAtomic || null, budget: p.budget || null,
+    txHash: p.txHash || null, receipt: p.receipt || null, result: p.result || null, execution,
   };
 }
 function publicUsage(p) {
@@ -170,22 +185,23 @@ export function registerAgentPayRoutes(app) {
   app.get('/api/agentpay/v1/manifest', (_req, res) => res.json(agentPayManifest()));
   app.get('/api/agentpay/v1/discovery', async (_req, res) => res.json(await aiplansSnapshot()));
   app.get('/api/agentpay/v1/readiness', async (req, res) => res.json(await agentPayReadiness({ skipContracts: req.query.mode === 'recorded' })));
+  app.get('/api/agentpay/v1/policies/:policyId/budget', async (req, res) => res.json({ policyId: req.params.policyId, budget: await purchaseService.getBudget(req.params.policyId) }));
 
   app.post('/api/agentpay/v1/policies/:policyId/reservations', async (req, res) => {
     const body = req.body || {};
     const purchaseId = String(body.purchaseId || crypto.randomUUID());
     const offer = currentOffers().find((item) => item.offerId === String(body.offerId || ''));
     if (!offer) return problem(res, 422, 'no_eligible_offer', 'discovery', 'requote', 'Offer is not in the current Toolkit offer set', purchaseId);
-    const hasAnyRequestBounds = Object.hasOwn(body, 'inputTokens') || Object.hasOwn(body, 'outputCap');
     const hasRequestBounds = Number.isSafeInteger(body.inputTokens) && body.inputTokens >= 0
       && Number.isSafeInteger(body.outputCap) && body.outputCap >= 0;
-    if (hasAnyRequestBounds && !hasRequestBounds) return problem(res, 422, 'offer_invalid', 'reservation', 'stop', 'Request token bounds are invalid', purchaseId);
-    if (hasRequestBounds) {
-      let expectedRequestDigest;
-      try { expectedRequestDigest = sha256Digest({ inputTokens: body.inputTokens, outputCap: body.outputCap, offerId: offer.offerId, body: body.request || {} }); }
-      catch { return problem(res, 422, 'offer_invalid', 'reservation', 'stop', 'Provider request cannot be canonicalized', purchaseId); }
-      if (String(body.requestDigest || '') !== expectedRequestDigest) return problem(res, 409, 'request_digest_conflict', 'reservation', 'retry_same_purchase', 'Request digest does not match the provider request', purchaseId);
-    }
+    if (!hasRequestBounds) return problem(res, 422, 'offer_invalid', 'reservation', 'stop', 'Request token bounds are required before authorization', purchaseId);
+    if (body.inputTokens > offer.maxInputTokens || body.outputCap > offer.maxOutputTokens) return problem(res, 422, 'offer_invalid', 'reservation', 'stop', 'Request token bounds exceed the selected offer', purchaseId);
+    const worstCaseAtomic = calculateChargeAtomic(body.inputTokens, body.outputCap, offer.inputAtomicPerMillion, offer.outputAtomicPerMillion);
+    if (worstCaseAtomic > BigInt(offer.x402MaxAtomic)) return problem(res, 422, 'price_exceeds_policy', 'preflight', 'requote', 'Request worst-case charge exceeds the offer ceiling', purchaseId);
+    let expectedRequestDigest;
+    try { expectedRequestDigest = sha256Digest({ inputTokens: body.inputTokens, outputCap: body.outputCap, offerId: offer.offerId, body: body.request || {} }); }
+    catch { return problem(res, 422, 'offer_invalid', 'reservation', 'stop', 'Provider request cannot be canonicalized', purchaseId); }
+    if (String(body.requestDigest || '') !== expectedRequestDigest) return problem(res, 409, 'request_digest_conflict', 'reservation', 'retry_same_purchase', 'Request digest does not match the provider request', purchaseId);
     if (process.env.AGENTPAY_RECORDED === '0') {
       const policy = body.policy;
       const verifiedPolicy = await verifyProcurementPolicy({ policy, signature: body.policySignature });
@@ -198,10 +214,14 @@ export function registerAgentPayRoutes(app) {
         && policy?.schema === 'agentpay.policy.v1'
         && Number(policy?.chainId) === 10143
         && String(policy?.asset || '').toLowerCase() === MONAD_USDC.toLowerCase()
+        && offer.network === 'eip155:10143'
+        && String(offer.asset || '').toLowerCase() === MONAD_USDC.toLowerCase()
         && String(policy?.policyId || '').toLowerCase() === String(req.params.policyId).toLowerCase()
         && (policy?.allowedPayTo || []).map((value) => String(value).toLowerCase()).includes(offer.payTo.toLowerCase())
         && (policy?.allowedModels || []).includes(`${offer.providerSlug}/${offer.modelSlug}`)
-        && BigInt(policy?.maxPerRequestAtomic || '0') >= BigInt(offer.x402MaxAtomic)
+        && Number(policy?.validUntil || 0) > Math.floor(Date.now() / 1000)
+        && worstCaseAtomic <= BigInt(policy?.maxPerRequestAtomic || '0')
+        && BigInt(offer.x402MaxAtomic) <= BigInt(policy?.maxPerRequestAtomic || '0')
         && BigInt(policy?.maxTotalAtomic || '0') >= BigInt(offer.x402MaxAtomic)
         && expectedPurchase
         && String(intent.purchaseId || '').toLowerCase() === expectedPurchase
@@ -211,6 +231,7 @@ export function registerAgentPayRoutes(app) {
         && String(intent.maxAtomic || '') === String(offer.x402MaxAtomic)
         && Number.isSafeInteger(expiry) && expiry > Math.floor(Date.now() / 1000) && expiry <= policyExpiry;
       if (!bound) return problem(res, 403, 'policy_invalid', 'authorization', 'stop', 'Reservation intent signature or binding is invalid', purchaseId);
+      if (policy.requireHumanApproval === true && body.humanApproval !== true) return problem(res, 403, 'policy_invalid', 'authorization', 'stop', 'Owner policy requires human approval before purchase', purchaseId);
     }
     try {
       // The plaintext progress token is returned only to the request that won
@@ -220,7 +241,7 @@ export function registerAgentPayRoutes(app) {
       const purchase = await purchaseService.reservePolicyBudget({
         purchaseId, policyId: req.params.policyId, offer, request: body.request || { prompt: 'Build a Monad demo' },
         requestDigest: body.requestDigest || hash(body.request || {}), inputTokens: body.inputTokens, outputCap: body.outputCap,
-        maximumAtomic: offer.x402MaxAtomic, policy: body.policy,
+        maximumAtomic: offer.x402MaxAtomic, policy: body.policy, humanApproval: body.humanApproval,
         agentWallet: body.policy?.agentWallet,
         progressTokenHash: hash(progressToken),
       });
@@ -301,6 +322,10 @@ export function registerAgentPayRoutes(app) {
       const payload = verifiedPayment?.paymentPayload;
       const payer = verifiedPayment?.verification?.payer || payload?.payload?.permit2Authorization?.from || '0x14791697260E4c9A71f18484C9f997B308e59325';
       const nonce = payload?.payload?.permit2Authorization?.nonce || `nonce_${purchaseId}`;
+      const expectedPayer = purchase.agentWallet || purchase.policy?.agentWallet;
+      if (verifiedPayment && /^0x[0-9a-f]{40}$/i.test(String(expectedPayer || '')) && String(payer).toLowerCase() !== String(expectedPayer).toLowerCase()) {
+        return problem(res, 403, 'authorization_conflict', 'authorization', 'stop', 'Payment payer is different from the policy agent wallet', purchaseId);
+      }
       await purchaseService.bindAuthorization(purchaseId, { payer, nonce, signatureDigest: hash(paymentHeader) }, verifiedPayment && requirements ? { paymentPayload: verifiedPayment.paymentPayload, requirements } : null);
       let actualAtomic = purchase.actualAtomic;
       if (purchase.state !== 'settlement_failed') {
@@ -310,9 +335,10 @@ export function registerAgentPayRoutes(app) {
           if (executionClaim.state === 'matched') return res.json({ ...executionClaim.result, purchaseId, receipt: executionClaim.receipt });
           return problem(res, 409, 'settlement_pending', 'execution', 'continue_reconciliation', 'Another request owns provider execution for this purchase', purchaseId);
         }
-        const providerExecution = await invokeZhipu({ prompt: req.body?.prompt, messages: req.body?.messages, outputCap: purchase.outputCap, model: offer.modelSlug });
+        const providerExecution = await invokeZhipu({ prompt: req.body?.prompt, messages: req.body?.messages, inputTokens: purchase.inputTokens, outputCap: purchase.outputCap, model: offer.modelSlug });
         const inputTokens = providerExecution.usage.inputTokens;
         const outputTokens = providerExecution.usage.outputTokens;
+        if (inputTokens > purchase.inputTokens) { await purchaseService.markFailedUnsettled(purchaseId, { reason: 'provider_input_exceeds_reserved_bound' }); return problem(res, 409, 'disputed_amount', 'execution', 'stop', 'Provider input usage exceeds the reserved input bound', purchaseId); }
         if (Number.isSafeInteger(purchase.outputCap) && outputTokens > purchase.outputCap) { await purchaseService.markFailedUnsettled(purchaseId, { reason: 'provider_output_exceeds_reserved_cap' }); return problem(res, 409, 'disputed_amount', 'execution', 'stop', 'Provider usage exceeds the reserved output cap', purchaseId); }
         const numerator = BigInt(inputTokens) * BigInt(offer.inputAtomicPerMillion) + BigInt(outputTokens) * BigInt(offer.outputAtomicPerMillion);
         actualAtomic = ((numerator + 999999n) / 1000000n).toString();
@@ -407,6 +433,7 @@ export function agentPayManifest() {
     endpoints: {
       discovery: '/api/agentpay/v1/discovery',
       readiness: '/api/agentpay/v1/readiness',
+      budget: '/api/agentpay/v1/policies/{policyId}/budget',
       reservation: '/api/agentpay/v1/policies/{policyId}/reservations',
       invocation: '/api/agentpay/v1/models/{provider}/{model}/invoke',
       events: '/api/agentpay/v1/purchases/{purchaseId}/events',
@@ -427,7 +454,7 @@ export function agentPayManifest() {
       'unknown mappings, readiness failures, and disputed chain evidence fail closed',
     ],
     modes: { recorded: 'deterministic fixture for replay', live: 'requires readiness, funded wallet, provider credentials, and facilitator allowlist' },
-    links: { product: 'https://toolkit.fun', modelDiscovery: 'https://aiplans.dev', sdk: 'https://github.com/x2v-co/agentpay/tree/main/packages/sdk' },
+    links: { product: 'https://toolkit.fun', modelDiscovery: 'https://aiplans.dev', sdk: 'https://github.com/mohammedrehan143/agentpay' },
   };
 }
 
