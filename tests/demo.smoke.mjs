@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { readFile, stat } from "node:fs/promises";
+import { fileURLToPath } from "node:url";
 
 const [html, css, script] = await Promise.all([
   readFile(new URL("../apps/demo/replay.html", import.meta.url), "utf8"),
@@ -10,7 +11,7 @@ const [html, css, script] = await Promise.all([
 
 execFileSync(process.execPath, [
   "--check",
-  new URL("../apps/demo/app.js", import.meta.url).pathname,
+  fileURLToPath(new URL("../apps/demo/app.js", import.meta.url)),
 ]);
 
 assert.equal(

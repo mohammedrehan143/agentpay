@@ -1,4 +1,5 @@
 import express from 'express';
+try { process.loadEnvFile?.(); } catch {}
 import { randomBytes, randomUUID, createHash } from 'node:crypto';
 import { createPublicClient, http, erc20Abi, encodeFunctionData, parseEventLogs } from 'viem';
 import { monadTestnet } from 'viem/chains';

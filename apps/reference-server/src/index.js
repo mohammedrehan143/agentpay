@@ -4,6 +4,8 @@ import express from 'express';
 import { registerAgentPayRoutes, purchaseService } from './agentpay.js';
 import { startAgentPayReconciliationJob } from './reconciliation_job.js';
 
+try { process.loadEnvFile?.(); } catch {}
+
 const here = path.dirname(fileURLToPath(import.meta.url));
 
 export function createApp() {
