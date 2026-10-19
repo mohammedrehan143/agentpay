@@ -1,11 +1,8 @@
 {
-  "version": 2,
-  "buildCommand": "npm run build",
-  "outputDirectory": "dist",
-  "cleanUrls": true,
   "rewrites": [
     { "source": "/api/(.*)", "destination": "/api/index.js" },
-    { "source": "/agentpay", "destination": "/index.html" },
-    { "source": "/agentpay/(.*)", "destination": "/$1" }
+    { "source": "/agentpay", "destination": "/agentpay/index.html" },
+    { "source": "/agentpay/", "destination": "/agentpay/index.html" },
+    { "source": "/agentpay/(.*)", "destination": "/agentpay/$1" }
   ]
 }

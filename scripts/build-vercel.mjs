@@ -4,19 +4,21 @@ import { fileURLToPath } from 'node:url';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const demoDir = path.join(root, 'apps', 'demo');
+const publicDir = path.join(root, 'public');
 const distDir = path.join(root, 'dist');
-const distAgentpayDir = path.join(distDir, 'agentpay');
 
 console.log('Building AgentPay for Vercel deployment...');
 
-// Clean dist
+// Prepare public directory (default Vercel static output)
+await rm(publicDir, { recursive: true, force: true });
+await mkdir(publicDir, { recursive: true });
+await cp(demoDir, publicDir, { recursive: true });
+await cp(demoDir, path.join(publicDir, 'agentpay'), { recursive: true });
+
+// Also prepare dist directory
 await rm(distDir, { recursive: true, force: true });
 await mkdir(distDir, { recursive: true });
-
-// Copy demo to root of dist
 await cp(demoDir, distDir, { recursive: true });
+await cp(demoDir, path.join(distDir, 'agentpay'), { recursive: true });
 
-// Also copy demo to dist/agentpay for compatibility with /agentpay/ URLs
-await cp(demoDir, distAgentpayDir, { recursive: true });
-
-console.log('Vercel build complete: dist/ ready.');
+console.log('Vercel build complete: public/ and dist/ ready.');
